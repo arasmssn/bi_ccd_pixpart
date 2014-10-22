@@ -1,1 +1,1 @@
-/home/arasmus/ray2_export/xray_bi_ccd.h
+void xray_bi_ccd (char *xray_arglist,ccd_runpars *ccd_rp);

@@ -1,1 +1,1 @@
-/home/arasmus/ray2_export/bi_ccd_func.c
+bi_ccd_func.c_130117_edit
