@@ -1,0 +1,1973 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <time.h>
+#include <string.h>
+#include "ray.h"
+#include "numrec/include/nr.h"
+#include "numrec/include/nrutil.h"
+
+#define BI_CCD_FUNC
+#include "bi_ccd.h"
+#include "field_superpose.h"
+#undef BI_CCD_FUNC
+
+#include "multilayer.h"
+
+float N_bulk,N_f,N_b,s_f,s_b,t_si;
+
+enum direction {FORWARD=0,BACKWARD=1};
+enum boundarytype {BND_EITHER=0,BND_COLUMN=1,BND_ROW=2};
+
+typedef struct {
+  double *sigma_resp;
+  double *tcol;
+  double *emag;
+  double *potential;
+  vec    *pos;
+} driftstruct;
+
+int multipole_stack_pinch(vec *p1,vec *p2,vec *pinch,
+			  enum boundarytype bndtype,
+			  bi_ccd_pars *pars,double *e1,
+			  multipole_stack *msi);
+void target_pix(int x,int y,vec *ps,bi_ccd_pars *pars,
+		multipole_stack *msi,double *e,int n_vals,
+		enum boundarytype bndtype);
+void drift2pix (vec *ps,bi_ccd_pars *pars,multipole_stack *msi,
+		double *e,int n_vals,int *xpix,int *ypix);
+void dipole_3d (vec *x_vec,vec *p_vec,vec *x0_vec,vec *dummy,vec *field);
+void dipole_2d (vec *x_vec,vec *p_vec,vec *x0_vec,vec *sym_axis,vec *field);
+
+int  multipole_stack_locate_saddle(vec *p1,vec *p2,vec *p3,
+				   enum boundarytype type,
+				   bi_ccd_pars *pars, double *e1,
+				   multipole_stack *msi);
+void multipole_stack_cat(multipole_stack **a,multipole_stack *b);
+void drift (vec *ps,driftstruct *ds,
+	    bi_ccd_pars *pars,multipole_stack *msi,double *e,
+	    int n_vals,enum direction reverse,int *iter);
+void compute_ccd_transport(bi_ccd_pars *pars);
+void Estat_profile (double *E,double *v,int n_vals,bi_ccd_pars *ccdp,int ntrap);
+float  dope_profile(float z);
+double bi_ccd_plnsurf (vec *v);
+
+float xco,yco,zco,cco;
+
+static float dp[N_LAYERS]; // dp is a global because it's needed in 2 separate routines. not passing it between them.
+
+int bi_ccd(ray *inc_ray,ray **detected_array,int **n_detected,ccd_runpars *ccd_rp ) {
+  static int i,n_vals=N_LAYERS;
+  static float z[N_LAYERS];
+  static double E[N_LAYERS],v[N_LAYERS];
+  static double tcol[N_LAYERS],sigma[N_LAYERS];
+  static double dopevar_lat_resp[N_LAYERS];
+  static double chanpop_lat_resp[N_LAYERS];
+  static double biasvar_lat_resp[N_LAYERS];
+
+  static bi_ccd_pars prev_pars;
+  static long  iduml;
+  static int   idum=-1;
+  static float reflectivity=0;
+  static int   weight_definite;
+  static float poisson_weight;
+  static int   ray_array_length=0;
+  static ray   *detected_rays;
+  static int   num_rays_output;
+  static float T,z0;
+
+  static multilayer *ml,prev_ml;
+
+  if (memcmp(&ccd_rp->ml,&prev_ml,sizeof(multilayer))) {
+    // multilayer must have already been initialized.
+    ml=&ccd_rp->ml;
+    memcpy(&prev_ml,&ccd_rp->ml,sizeof(multilayer));
+  }
+
+  if (memcmp(&ccd_rp->ccdpars,&prev_pars,sizeof(bi_ccd_pars))) {
+    // need to initialize..
+    float overdep_bias;
+
+    fprintf(stderr,"initializing..\n");
+    // setup the sigma(z) profile stuff
+    ccd_rp->ccdpars.n_sigma=(int)n_vals;
+    // currently the following linkup is done and any time any changes in
+    // the ccdpars is detected, transport arrays are recalculated.
+    // another alternative would be to allocate new transport arrays 
+    // and manage them so that recalculation won't be necessary.
+    ccd_rp->ccdpars.z=(float*)z;
+    ccd_rp->ccdpars.dp=(float*)dp;
+    ccd_rp->ccdpars.e=(double*)E;
+    ccd_rp->ccdpars.v=(double*)v;
+    ccd_rp->ccdpars.tcol=(double*)tcol;
+    ccd_rp->ccdpars.lateral_sigma=(double*)sigma;
+    ccd_rp->ccdpars.dopevar_lat_resp=(double*)dopevar_lat_resp;
+    ccd_rp->ccdpars.chanpop_lat_resp=(double*)chanpop_lat_resp;
+    ccd_rp->ccdpars.biasvar_lat_resp=(double*)biasvar_lat_resp;
+    memcpy(&prev_pars,&ccd_rp->ccdpars,sizeof(bi_ccd_pars));
+
+
+    // multilayer specific data: set the Si temperature, Si thickness 
+    // and then initialize.
+    // alter only thickness of the depleted layer 
+    // used to be layer_thickness[nlayer-1]
+    // now instead of index nlayer-1 use index ccd_rp->depleted_layer_ix
+    
+    // ccd_rp->ccdpars.layer_thickness[ccd_rp->ccdpars.nlayer-1]= 
+    //    ccd_rp->ccdpars.layer_thickness[ccd_rp->depleted_layer_ix]= 
+    //      ccd_rp->ccdpars.t_si*1e7; // t_si is in cm, thicknesses in nm
+
+    // compare received layer indices.
+    //    fprintf(stderr,"nlayer-1 = %d depleted_layer_ix = %d\n",ccd_rp->ccdpars.nlayer-1,ccd_rp->depleted_layer_ix);
+
+
+    set_ml_Si_Temp(ccd_rp->ccdpars.T);
+    init_multilayer(&ccd_rp->ml,
+		    ccd_rp->ccdpars.nlayer,
+		    ccd_rp->ccdpars.layer_thickness,
+		    ccd_rp->ccdpars.oc,
+		    ccd_rp->ccdpars.oc_const_n);
+
+    // doping specific
+
+
+    if (1) {
+      // the following 6 lines are redundant:
+      // computed also in Estat_profile() - but left here for the printout purposes
+      N_bulk       = ccd_rp->ccdpars.N_bulk;
+      N_f          = ccd_rp->ccdpars.N_f;
+      N_b          = ccd_rp->ccdpars.N_b;
+      s_f          = ccd_rp->ccdpars.s_f;
+      s_b          = ccd_rp->ccdpars.s_b;
+      t_si         = ccd_rp->ccdpars.t_si;
+    }
+
+    T            = ccd_rp->ccdpars.T;
+    overdep_bias = ccd_rp->ccdpars.overdep_bias;
+    z0           = ccd_rp->z0;
+    reflectivity = ccd_rp->reflectivity;
+    weight_definite = ccd_rp->weight_definite;
+    poisson_weight  = ccd_rp->poisson_weight;
+
+    fprintf(stderr,
+	    "doping parameters:\n"
+	    "\tN_bulk:   %9g cm-3\n"
+	    "\tt_si:     %9g microns\n"
+	    "\tN_f:      %9g cm-3\n"
+	    "\ts_f:      %9g microns\n"
+	    "\tN_b:      %9g cm-3\n"
+	    "\ts_b:      %9g microns\n"
+	    "\tV_overdep:%9g V\n",
+	    N_bulk,
+	    t_si*1e4,
+	    N_f,
+	    s_f*1e4,
+	    N_b,
+	    s_b*1e4,
+	    overdep_bias);
+
+    fprintf(stderr,
+	    "pert. parameters:\n"
+	    "\tz0:            %9g mm\n"
+	    "\tT:             %9g K\n",z0,T);
+
+    compute_ccd_transport(&ccd_rp->ccdpars);
+
+    if (poisson_weight!=0) 
+      fprintf(stderr,
+	      "poisson weighting (per ray): %f\n",poisson_weight);
+    if (weight_definite!=1) {
+      if (poisson_weight!=0) {
+	fprintf(stderr,
+		"warning ***IGNORING*** specified definite weighting (per ray): %d\n",weight_definite);
+      } else {
+	fprintf(stderr,
+		"definite weighting (per ray): %d\n",weight_definite);
+      }
+    }
+
+    if (bi_ccd_setup_only) {
+      bi_ccd_setup_only=0;
+      return(0);
+    }
+
+    if (bi_ccd_print_only) {
+      printf("lab g1 CCD z (from frontside) [\\gmm]\n");
+      printf("lab g2 doping density [cm\\u-3\\d]\n");
+      printf("lab g3 field strength [kV cm\\u-1\\d]\n");
+      printf("lab g4 field potential [V]\n");
+      printf("lab g5 collection time [s]\n");
+      printf("lab g6 diffusion scale [\\gmm]\n");
+      printf("lab g7 lateral dopevar resp [mm\\u2\\d/%%]\n");
+      printf("lab g8 lateral chanpop resp [mm\\u2\\d/%%]\n");
+      printf("lab g9 lateral biasvar resp [mm\\u2\\d/V]\n");
+
+      for (i=0;i<n_vals;i++) {
+	printf("%g %g %g %g %g %g %g %g %g\n",
+	       ccd_rp->ccdpars.z[i]*1e4,
+	       ccd_rp->ccdpars.dp[i],
+	       ccd_rp->ccdpars.e[i]/1000.,
+	       ccd_rp->ccdpars.v[i],
+	       ccd_rp->ccdpars.tcol[i],
+	       ccd_rp->ccdpars.lateral_sigma[i],
+	       0.01*ccd_rp->ccdpars.dopevar_lat_resp[i],
+	       0.01*ccd_rp->ccdpars.chanpop_lat_resp[i],
+	       0.01*ccd_rp->ccdpars.biasvar_lat_resp[i]);
+      }
+      exit(0);
+    }
+    time(&iduml);
+    idum=-1;
+    {
+      int ninit=iduml%16383;
+      iduml=-1;
+      for (i=0; i<ninit;i++) {
+	gasdev(&idum);
+	ran2(&iduml);
+      }
+    }
+  }
+
+  // current lookup tables are valid. handle one ray at a time.
+
+  {
+    // read in the rays and collapse at the back surface..
+    ray aray,bray;
+    vec normal;
+    float mfp,lamda=3000,travel;
+    float defl_x,defl_y;
+    int ndetect=0,nmiss=0;
+    float qde;
+
+    normal.x = normal.y = 0.0;
+    normal.z = 1;
+    xco=yco=0.0;
+    zco=1.0;
+    cco=z0;
+
+    memcpy(&aray,inc_ray,sizeof(ray));
+
+    {
+      multilayer *ml=&ccd_rp->ml;
+      float theta,lambda;
+      vec   direction;
+      cpvec(&aray.k,&direction);      unitvec(&direction);
+      theta=acos(fabs(dot_prod(&direction,&normal)));
+      lambda=0.1*(2*M_PI)/modulus(&aray.k); // in nm
+      compute_multilayer(theta,lambda,ml);
+      //      qde=ml->lp[ml->nlayer-1].Dq_ave;
+      qde=ml->lp[ccd_rp->depleted_layer_ix].Dq_ave;
+    }
+
+    int ngen,ix;
+    
+    lamda=(2*M_PI)/modulus(&aray.k);
+    mfp=10/abs_coeff(lamda,T); // abs_coeff in cm-1, mfp in mm
+    
+    if (poisson_weight==0) {
+      ngen=weight_definite;
+    } else {
+      ngen=poidev(poisson_weight,&idum);
+    }
+    
+    // ngen output rays will be produced.
+    if (ray_array_length<ngen) {
+      if (ray_array_length!=0) {
+	free(detected_rays);
+      }
+      if ((detected_rays=(ray*)malloc(ngen*sizeof(ray)))==NULL) 
+	complain("cannot allocate detected_rays\n");
+      ray_array_length=ngen;
+    }
+    
+    *n_detected=&num_rays_output;
+    *detected_array=detected_rays;
+    num_rays_output=0;
+
+    if (ray_surface_collapse(&aray,bi_ccd_plnsurf)) {
+      // refract the ray. (snell's law)
+      vec orig_kvector;
+      cpvec(&aray.k,&orig_kvector);
+      // here put in code to compute transmission through an AR coating
+      //      if () 
+      // end of AR coating call
+
+      if (refract_ray(&aray.k,&normal,1,n_silicon(lamda))) {
+	vec refract;
+	float fl_ind,t,u,zd,sg,cplr,dvlr,bvlr;
+	int   ind;
+
+	// variables used to compute internal reflectivity/fringing stuff
+	multilayer *ml      = &ccd_rp->ml;
+	//	int        layer_ix = ml->nlayer-1;
+	int        layer_ix = ccd_rp->depleted_layer_ix;
+	complex    rho_q[2],rho_qp[2];
+	float      R,Rp,f,q,r0,r1,zint,total_z_travel;
+	double     atten,range;
+	int        npass,internal_reflectivities_computed;
+	
+	// aray is the original ray - with k vector modified to 
+	// head in the refracted direction.
+	// since multiple electrons will be outputted
+	// each with different range (along aray.k) and with different
+	// diffusion drift, aray contents will not be altered.
+	// output ray is called bray.
+
+	internal_reflectivities_computed = 0;
+
+	for (ix=0;ix<ngen;ix++) {
+	  if (qde > ran2(&iduml)) {
+	    memcpy(&bray,&aray,sizeof(ray)); // copy aray into bray
+	    cpvec(&bray.k,&refract);         // copy bray.k into refract
+	    unitvec(&refract);
+
+	    if (1) { // compute the interaction point of this photon given the matrix
+	      // formalism and additional return values in the ml struct
+	      // do the following only once per loop (up to ngen)
+	      if (internal_reflectivities_computed == 0) {
+		compute_layer_internal_reflectivities(ml,layer_ix,rho_q,rho_qp);
+		R  = 0.5*(cpx_modulus(&rho_q[0])+cpx_modulus(&rho_q[1]));
+		Rp = 0.5*(cpx_modulus(&rho_qp[0])+cpx_modulus(&rho_qp[1]));
+		atten = 1-exp(-2*ml->lp[layer_ix].beta.comp[1]);
+		q=1.0/(1+(1-atten)*Rp);
+		f=pow(1-atten,2)*R*Rp;
+		internal_reflectivities_computed=1;
+	      }
+
+	      r0=ran2(&iduml);
+
+	      npass=floor(log(r0)/log(f));
+	      //	      range = -2*fabs(1e-6*ml->lp[layer_ix].thickness)/log(1-atten);
+	      range = fabs(1e-6*ml->lp[layer_ix].thickness)/
+		ml->lp[layer_ix].beta.comp[1];
+
+	      do {
+		zint = range * expdev(&idum);
+	      } while (zint > fabs(1e-6*ml->lp[layer_ix].thickness));
+	      r1=ran2(&iduml);
+	      if (r1<q) {
+		// photon stopped in forward direction
+		total_z_travel = 
+		  2*npass*fabs(1e-6*ml->lp[layer_ix].thickness)+zint;
+	      } else {
+		// photon stopped in reverse direction
+		total_z_travel = 
+		  (2*npass+1)*fabs(1e-6*ml->lp[layer_ix].thickness)+zint;
+	      }
+	      // now evaluate the absolute interaction position and the 
+	      // absolute drifted position. recall z_int and total_z_travel
+	      // are measured in mm.
+	      scalevec(&refract,total_z_travel/fabs(refract.z));
+
+	      {
+		float zdep=fabs(refract.z);
+		float t   =fabs(10*t_si);
+		zdep=t-fabs((zdep-floor(zdep/(2*t))*(2*t))-t);
+		if (refract.z<0) {
+		  refract.z = -zdep;
+		} else {
+		  refract.z = +zdep;
+		}
+		vec_add(&bray.p,&refract,&bray.p);
+		// bray.p is the position of the stopped ray.
+		// but can use refract.z to determine the drift time etc.
+		fl_ind=(fabs(refract.z)/(10*t_si))*(n_vals-1);
+		ind=floor(fl_ind);
+
+		t=fl_ind-ind;
+		u=1-t;
+
+		if (ind==n_vals-1) {
+		  zd = z[ind];
+		  sg = sigma[ind];
+		  cplr = chanpop_lat_resp[ind];
+		  dvlr = dopevar_lat_resp[ind];
+		  bvlr = biasvar_lat_resp[ind];
+		  // here should add some functionality for transverse drift due to channel population & doping variation.
+		} else {
+		  zd = t*z[ind+1]     + u*z[ind];
+		  sg = t*sigma[ind+1] + u*sigma[ind];
+		  cplr = t*chanpop_lat_resp[ind+1] + u*chanpop_lat_resp[ind];
+		  dvlr = t*dopevar_lat_resp[ind+1] + u*dopevar_lat_resp[ind];
+		  bvlr = t*biasvar_lat_resp[ind+1] + u*biasvar_lat_resp[ind];
+		  // here should add some functionality for transverse drift due to channel population & doping variation.
+		}
+
+		defl_x=sg/1e3*gasdev(&idum); // deflection by dispersion and by lateral drifts
+		defl_y=sg/1e3*gasdev(&idum); // values in mm
+		
+		if (sqrt(defl_x*defl_x+defl_y*defl_y) < 0.1) { // lose the electron if it disperses more than 100 microns
+		  bray.p.x += defl_x;
+		  bray.p.y += defl_y;
+		  // add in contributions by lateral gradients in channel population and in doping density
+		  {
+		    float grad_dopdens[]={0,0};
+		    float grad_chanpop[]={0,0};
+		    float grad_biasvar[]={0,0};
+
+		    if (ccd_rp->dopevar_grad!=NULL) {
+		      memcpy(grad_dopdens,
+			     ccd_rp->dopevar_grad(bray.p.x,bray.p.y),
+			     2*sizeof(float));
+		    }
+		    if (ccd_rp->chanpop_grad!=NULL) {
+		      memcpy(grad_chanpop,
+			     ccd_rp->chanpop_grad(bray.p.x,bray.p.y),
+			     2*sizeof(float));
+		    }
+		    if (ccd_rp->biasvar_grad!=NULL) {
+		      memcpy(grad_biasvar,
+			     ccd_rp->biasvar_grad(bray.p.x,bray.p.y),
+			     2*sizeof(float));
+		      /* fprintf(stderr,"x y %f %f bgrad %f %f\n", */
+		      /* 	      bray.p.x, */
+		      /* 	      bray.p.y, */
+		      /* 	      grad_biasvar[0], */
+		      /* 	      grad_biasvar[1]); */
+		    }
+		    //		    fprintf(stderr,"x=%f bvlr=%f grad_biasvar=%f\n",bray.p.x,bvlr,grad_biasvar[0]);
+		    {
+
+		      bray.p.x += cplr*grad_chanpop[0]; // in mm
+		      bray.p.x += dvlr*grad_dopdens[0]; // in mm
+		      bray.p.x += bvlr*grad_biasvar[0]; // in mm
+
+		      bray.p.y += cplr*grad_chanpop[1]; // in mm
+		      bray.p.y += dvlr*grad_dopdens[1]; // in mm
+		      bray.p.y += bvlr*grad_biasvar[1]; // in mm
+		    }
+		  }
+
+		  if (0) { // stop the ray from travelling any more:
+		    bray.k.x=bray.k.y=bray.k.z=0;
+		    // added this so that find_focus won't barf..
+		    bray.k.z=1;
+		  } else { 
+		    // keep the original, unrefracted bray.k with the altered 
+		    // bray.p; 
+		    // also reset bray.p.z to zero so that additional testing 
+		    // can be done.
+		    bray.p.z=0;
+		    cpvec(&orig_kvector,&bray.k);
+		  }
+		  memcpy(&detected_rays[num_rays_output++],&bray,sizeof(ray));
+		  //		fwrite(&bray,sizeof(ray),1,stdout);
+		  ndetect++;
+		} else {
+		  // diffusion exceeds 100um!! forget it..
+		  nmiss++;
+		}
+	      }
+	    }
+
+	    if (0) { // another old way that miscomputed the photon range
+	      // given a separate constraint that the photon was detected (qde)
+	      travel=mfp*expdev(&idum);
+	      // scale k unit vector by travel and collapse at that position
+	      scalevec(&refract,travel);
+	      
+	      // given that the photon was detected (based on QDE test) 
+	      // determine where this one will drift from given the refract vector
+	      
+	      {
+		float zdep=fabs(refract.z);
+		float t   =fabs(10*t_si);
+		zdep=t-fabs((zdep-floor(zdep/(2*t))*(2*t))-t);
+		if (refract.z<0) {
+		  refract.z=-zdep;
+		} else {
+		  refract.z=+zdep;
+		}
+		vec_add(&bray.p,&refract,&bray.p);
+		// bray.p is the position of the stopped ray.
+		// but can use refract.z to determine the drift time etc.
+		fl_ind=(fabs(refract.z)/(10*t_si))*(n_vals-1);
+		ind=floor(fl_ind);
+		t=fl_ind-ind;
+		u=1-t;
+		
+		if (ind==n_vals-1) {
+		  zd = z[ind];
+		  sg = sigma[ind];
+		} else {
+		  zd = t*z[ind+1]     + u*z[ind];
+		  sg = t*sigma[ind+1] + u*sigma[ind];
+		}
+		
+		defl_x=sg/1e3*gasdev(&idum); // deflection by dispersion
+		defl_y=sg/1e3*gasdev(&idum); // values in mm
+		
+		if (sqrt(defl_x*defl_x+defl_y*defl_y) < 0.1) { // lose the electron if it disperses more than 100 microns
+		  bray.p.x+=defl_x;
+		  bray.p.y+=defl_y;
+		  if (0) { // stop the ray from travelling any more:
+		    bray.k.x=bray.k.y=bray.k.z=0;
+		    // added this so that find_focus won't barf..
+		    bray.k.z=1;
+		  } else { 
+		    // keep the original, unrefracted bray.k with the altered 
+		    // bray.p; 
+		    // also reset bray.p.z to zero so that additional testing 
+		    // can be done.
+		    bray.p.z=0;
+		    cpvec(&orig_kvector,&bray.k);
+		  }
+		  memcpy(&detected_rays[num_rays_output++],&bray,sizeof(ray));
+		  //		fwrite(&bray,sizeof(ray),1,stdout);
+		  ndetect++;
+		} else {
+		  // diffusion exceeds 100um!! forget it..
+		  nmiss++;
+		}
+	      }
+	    }
+	    
+	    // make sure refract.z is smaller than CCD thickness.
+	    // remember since t_si is in cm but all vectors in mm.
+	    if (0) { // old way using light reflectivity
+	      if (fabs(refract.z)<10*fabs(t_si) || 
+		  (reflectivity>ran2(&iduml) && fabs(refract.z)<2*10*fabs(t_si))) { 
+		if (fabs(refract.z) > 10*fabs(t_si)) {
+		  if (refract.z<0) {
+		    refract.z = -(2 * 10*fabs(t_si) - fabs(refract.z));
+		  } else {
+		    refract.z =  (2 * 10*fabs(t_si) - fabs(refract.z));
+		  }
+		}
+		
+		vec_add(&bray.p,&refract,&bray.p);
+		// bray.p is the position of the stopped ray.
+		// but can use refract.z to determine the drift time etc.
+		fl_ind=(fabs(refract.z)/(10*t_si))*(n_vals-1);
+		ind=floor(fl_ind);
+		t=fl_ind-ind;
+		u=1-t;
+		
+		if (ind==n_vals-1) {
+		  zd = z[ind];
+		  sg = sigma[ind];
+		} else {
+		  zd = t*z[ind+1]     + u*z[ind];
+		  sg = t*sigma[ind+1] + u*sigma[ind];
+		}
+		
+		defl_x=sg/1e3*gasdev(&idum); // deflection by dispersion
+		defl_y=sg/1e3*gasdev(&idum); // values in mm
+		
+		if (sqrt(defl_x*defl_x+defl_y*defl_y) < 0.1) { // lose the electron if it disperses more than 100 microns
+		  bray.p.x+=defl_x;
+		  bray.p.y+=defl_y;
+		  if (0) { // stop the ray from travelling any more:
+		    bray.k.x=bray.k.y=bray.k.z=0;
+		    // added this so that find_focus won't barf..
+		    bray.k.z=1;
+		  } else { 
+		    // keep the original, unrefracted bray.k with the altered 
+		    // bray.p; 
+		    // also reset bray.p.z to zero so that additional testing 
+		    // can be done.
+		    bray.p.z=0;
+		    cpvec(&orig_kvector,&bray.k);
+		  }
+		  memcpy(&detected_rays[num_rays_output++],&bray,sizeof(ray));
+		  //		fwrite(&bray,sizeof(ray),1,stdout);
+		  ndetect++;
+		} else {
+		  // diffusion exceeds 100um!! forget it..
+		  nmiss++;
+		}
+	      } else {
+		// ray is not detected.
+		nmiss++;
+	      }
+	    } // old way using light reflectivity
+	  } else {
+	    // goes undetected due to finite QDE
+	    nmiss++;
+	  }
+	}
+      } else {
+	// not successfully refracted
+	nmiss+=ngen;
+      }
+    } else {
+      // not successfully collapsed
+      nmiss+=ngen;
+    }
+  }
+  return(num_rays_output);
+}
+
+double bi_ccd_plnsurf (vec *v) {
+  /* for now use 1*X + 0*Y + 1*Z */
+  return(xco*v->x + yco*v->y + zco*v->z - cco);
+}
+
+float dope_profile(float z) {
+  return(N_bulk
+	 +N_b*exp(-(t_si-z)/s_b)
+	 +N_f*exp(-(z)/s_f));
+}
+
+int complain_bi_ccd (char *s) {
+  fprintf(stderr,"%s",s);
+  exit(1);
+}
+
+float mu_Si (float E,float T) {
+  float mu,thisE;
+  thisE=fabs(E);
+
+
+  //  mu=5271.966*(0.6147317*exp(-thisE/1055.218)+
+  //	       0.42793864*exp(-thisE/7688.361)+
+  //	       0.0699523389*exp(-thisE/84489352));
+  // this expression comes from fitting vd/E for data read from fig. 7 of
+  // Canali et al. 1975, Phys. Rev. B, vol.15 No.4 p.2265. appropriate for 
+  // Silicon at 160K, <100> direction.
+  // Units are: E [v/cm], vd [cm/s] so mu = cm2/(s.v)
+  //            
+  // temperature dependence: for mu*E == 6e5 cm/s, dE/dT = 2.7 v/cm/K
+  // use the temperature (T) to modify thisE and carry out the 
+  // calculation as usual. This is a cheap substitute for a true 2D calc.
+  // temperature dependence based on figure 5 in Canali et al. 1975 to compute
+  // drift velocities at higher temperatures.
+
+  thisE += 2.7*(T-160);
+
+  if (thisE<100.0) {
+    thisE=100.0; // constant mobility below some field value
+  }
+
+  // original
+  mu=9000.0*pow(thisE,-0.1)*(0.605806231*exp(-thisE/2109.98047)+
+			     0.440742731*exp(-thisE/20483.25));
+
+  if (0) {
+    float t=0.25; // minimum value for t should be 0.4407
+    mu=9000.0*pow(thisE,-0.1)*((0.605806231+t)*exp(-thisE/2109.98047)+
+			       (0.440742731-t)*exp(-thisE/20483.25));
+  }
+  if (1) {
+    // use Jacobini et al (1977) parametrization of drift velocity etc.
+    float vsat=1e7;
+    vsat=2.4e7/(1+0.8*exp(T/600.0)); // jacobini eq. 11
+    // Jacobini equation (9) [originally other sources]
+    float vm=1.53e9 * pow(T,-0.87); // cm/s
+    float Ec = 1.01 * pow(T,1.55); // V/cm
+    float beta = 2.57e-2 * pow(T,0.66); // index
+    mu=(vm/Ec)/pow(1+pow(fabs(E)/Ec,beta),1/beta);
+  }
+  //  fprintf(stderr,"E=%f T=%f mu=%f\n",E,T,mu);
+  return(mu);
+}
+
+void Estat_profile (double *E,double *v,int n_vals,bi_ccd_pars *ccdp,int ntrap) {
+  float dz;
+  int i;
+  float overdep_bias;
+
+  // fill in the globals used by dope_profile
+  N_bulk=ccdp->N_bulk;  t_si=ccdp->t_si;
+  N_f=ccdp->N_f;        s_f=ccdp->s_f;
+  N_b=ccdp->N_b;        s_b=ccdp->s_b;
+
+  overdep_bias=ccdp->overdep_bias;
+
+  dz=(-t_si)/(float)(n_vals-1);
+  for (i=0;i<n_vals;i++) {
+    // these two arrays are for plotting purposes only
+    //    z[i]=t_si+i*dz;
+    //    dp[i]=dope_profile(z[i]);
+  }
+  i=0;
+  E[0]=overdep_bias/t_si;
+  // use the global array dp
+  if (dp==NULL) {
+    fprintf(stderr,"can't allocate in Estat_profile. exiting..\n");
+    exit(1);
+  }
+  for (i=0;i<n_vals;i++) {
+    int n_sample=100;
+    int j;
+    dp[i]=0;
+    for (j=0;j<n_sample;j++) {
+      dp[i]+=dope_profile(t_si+dz*(i+(j)/(float)(n_sample)));
+    }
+    dp[i] /= n_sample;
+    if (i>0)
+      E[i]=E[i-1]+dp[i]*q/(e_0*e_si)*dz;
+  }
+  // here zero out the E field in any undepleted bulk, if necessary
+  // finally compute the 
+  v[0]=0;
+  for (i=1;i<n_vals;i++) {
+    v[i]=v[i-1]-0.5*(E[i]+E[i-1])*dz;
+  }
+
+  // if ntrap!=0 then counter the doping profile etc 
+  if (ntrap != 0) {
+    if (0) {
+      // identify the location of the potential minimum
+      int minimum_i=0;
+      for (i=0;i<n_vals;i++) {
+	if (v[i]<=v[minimum_i]) {
+	  minimum_i=i;
+	}
+      }
+      // fill the potential well by matching traps with electrons
+      // until we've run out of charges
+      float nfill;
+      i=minimum_i;
+      while (ntrap>0 && i<n_vals) {
+	nfill = dp[i]*dz*pow(10e-4,2);
+	if (nfill>ntrap) {
+	  dp[i] -= ntrap/(dz*pow(10e4,2));
+	  ntrap=0;
+	} else {
+	  dp[i]=0;
+	  ntrap -= nfill;
+	}
+	i++;
+      }
+      for (i=minimum_i;i<n_vals;i++) {
+	E[i]=E[i-1]+dp[i]*q/(e_0*e_si)*dz;
+	v[i]=v[i-1]-0.5*(E[i]+E[i-1])*dz;
+      }
+    } else {
+      while (ntrap) {
+	// find the deepest potential well with some capacity for trapped
+	// charges
+	float min_v=1e10;
+	int min_ix;
+	float nfill;
+	for (i=0;i<n_vals;i++) {
+	  // locate potential well minimum
+	  if ((v[i]<min_v) && (dp[i]<0)) {
+	    min_v=v[i];
+	    min_ix=i;
+	  }
+	}
+	nfill = dp[min_ix]*dz*pow(10e-4,2);
+
+	fprintf(stderr,"minimum potential %g doping there %g capacity %g dz %g (index %d)\n",v[min_ix],dp[min_ix],nfill,dz,min_ix);
+	
+	if (nfill>ntrap) {
+	  dp[min_ix] -= ntrap/(dz*pow(10e-4,2));
+	  ntrap=0;
+	} else {
+	  if (dp[min_ix]<0) {
+	    dp[min_ix] = 0;
+	  } else {
+	    dp[min_ix] -= nfill/(dz*pow(10e-4,2));
+	  }
+	  ntrap -= nfill;
+	}	
+
+	// return to check whether more charges need to be located.
+	// recompute the potential profile using modified dp[]. This is 
+	// iterative, but with it_max=1.
+	E[0]=overdep_bias/t_si;
+	for (i=1;i<n_vals;i++) {
+	  E[i]=E[i-1]+dp[i]*q/(e_0*e_si)*dz;
+	  v[i]=v[i-1]-0.5*(E[i]+E[i-1])*dz;
+	}
+      }
+    }
+  }
+}
+
+void compute_ccd_transport(bi_ccd_pars *pars) {
+  double *e1,*e2,*e3,*e4;
+  double *v1,*v2,*v3,*v4;
+  double *lat_resp2,*lat_resp3,*lat_resp4;
+  int    nresp=201;
+  double  x[nresp];
+  driftstruct ds[nresp];
+  bi_ccd_pars tmp_pars;
+  int i,j;
+  int n_vals=pars->n_sigma;
+  float *z;
+  float dz=(-pars->t_si)/(pars->n_sigma-1);
+  float T=pars->T;
+  double *tcol=malloc(n_vals*sizeof(double));
+  double *sigma=malloc(n_vals*sizeof(double));
+
+  fprintf(stderr,"computing CCD transport..\n");
+  z=malloc(n_vals*sizeof(float));
+  for (i=0;i<n_vals;i++) z[i] = pars->t_si+i*dz;
+  // fill in x sampling uniformly between -0.01/10 and +0.01/10 cm
+  for (i=0;i<nresp;i++) x[i]  = (0.01/10.0)*(2*i/(nresp-1.0)-1);
+
+  for (i=0;i<nresp;i++) {
+    ds[i].sigma_resp=(double*)malloc(n_vals*sizeof(double));
+    ds[i].tcol=(double*)malloc(n_vals*sizeof(double));
+    ds[i].emag=(double*)malloc(n_vals*sizeof(double));
+    ds[i].potential=(double*)malloc(n_vals*sizeof(double));
+    ds[i].pos=(vec*)malloc(n_vals*sizeof(vec));
+    if ((ds[i].pos == NULL) || 
+	(ds[i].tcol == NULL) ||
+	(ds[i].emag == NULL) ||
+	(ds[i].potential == NULL) ||
+	(ds[i].sigma_resp == NULL)) {
+      fprintf(stderr,"can't allocate. exiting..\n");
+      exit(1);
+    }
+  }
+
+  e1=malloc(n_vals*sizeof(double));
+  e2=malloc(n_vals*sizeof(double));
+  e3=malloc(n_vals*sizeof(double));
+  e4=malloc(n_vals*sizeof(double));
+  v1=malloc(n_vals*sizeof(double));
+  v2=malloc(n_vals*sizeof(double));
+  v3=malloc(n_vals*sizeof(double));
+  v4=malloc(n_vals*sizeof(double));
+  lat_resp2=malloc(n_vals*sizeof(double));
+  lat_resp3=malloc(n_vals*sizeof(double));
+  lat_resp4=malloc(n_vals*sizeof(double));
+  memcpy(&tmp_pars,pars,sizeof(bi_ccd_pars));
+  // e1,v1 are field & potential profiles for the nominal configuration
+
+  Estat_profile(e1,v1,n_vals,&tmp_pars,0);
+
+  if (0) {
+
+    // e- * cm moment (100% fw) - suppose buried channel is 10nm deep
+    double p_moment=100000*q*(1.0)*1000e-7; 
+    // e- * cm / cm moment (analog of 1% fw)
+    double xi_moment=100000*q*1e3*(1.0*1e-3)/10.0; 
+    vec   field3d,field3di;
+    vec   field2d,field2di;
+    vec   field2d_edge,field2di_edge;
+    vec   rp,rpi,ps;
+    vec   origin={0,0,0};
+    vec   null={0,0,0};
+    // primary dipole
+    vec dipole3d={0,0,p_moment};
+    vec dipole2d={0,0,40*xi_moment};
+    vec dipole2d_vac={0,0,+1.7*xi_moment};
+    vec dipole2d_clocks={0,0,1*xi_moment}; // where do the lines turn around?
+    vec dipole2d_edge={0,0,-1000*xi_moment};
+
+
+    multipole_stack *msi_channel=NULL;
+    multipole_stack *msi_clocks=NULL;
+    multipole_stack *msi_cstop=NULL;
+    multipole_stack *msi_cstop_vac=NULL;
+    multipole_stack *msi_cstop_half=NULL;
+    multipole_stack *msi_test=NULL;
+    multipole_stack_init(&msi_channel);
+    multipole_stack_init(&msi_cstop);
+    multipole_stack_init(&msi_cstop_vac);
+    multipole_stack_init(&msi_cstop_half);
+    multipole_stack_init(&msi_clocks);
+    multipole_stack_init(&msi_test);
+
+    // align 2D dipoles to grid in phase with 0,0;
+    // align 3D dipoles (due to channel occupation) to grid in phase with
+    // ((x+0.5)*pix,(y+0.5)*pix))
+    {
+      int im;
+      vec sym_axis={0,0,0};
+
+      // construct field structure due to collected charge in a pixel
+      cpvec(&origin,&rp);
+      multipole_stack_append(&msi_channel,dipole_3d,&dipole3d,&rp,&sym_axis);
+      for (im=0;im<5;im++) {
+	cpvec(&rp,&rpi);
+	rpi.z = 2*(im+1)*pars->t_si;
+	multipole_stack_append(&msi_channel,dipole_3d,&dipole3d,&rpi,&sym_axis);
+	rpi.z = -2*(im+1)*pars->t_si;
+	multipole_stack_append(&msi_channel,dipole_3d,&dipole3d,&rpi,&sym_axis);
+      }
+      rpi.z = 2*(im+1)*pars->t_si;
+      multipole_stack_append(&msi_channel,dipole_3d,&dipole3d,&rpi,&sym_axis);
+
+      // construct field structure due to channel stops
+      int k;
+      sym_axis.x=0;
+      sym_axis.y=1;
+      sym_axis.z=0;
+      int n_cstop=40; // this should be even
+      // change this back
+      for (k=0;k<n_cstop;k++) {
+	cpvec(&origin,&rp);
+	rp.x=0.010/10.0*(k+0.5-n_cstop/2.0);
+	if (k==n_cstop/2)
+	  multipole_stack_append(&msi_cstop_vac,dipole_2d,&dipole2d_vac,&rp,&sym_axis);
+	multipole_stack_append(&msi_cstop,dipole_2d,&dipole2d,&rp,&sym_axis);
+	if (rp.x>0.010/10.0*(25+0.5-n_cstop/2.0))
+	  multipole_stack_append(&msi_cstop_half,dipole_2d,&dipole2d,&rp,&sym_axis);
+	for (im=0;im<5;im++) {
+	  cpvec(&rp,&rpi);
+	  rpi.z = 2*(im+1)*pars->t_si;
+	  if (k==n_cstop/2)
+	    multipole_stack_append(&msi_cstop_vac,dipole_2d,&dipole2d_vac,&rp,&sym_axis);
+	  multipole_stack_append(&msi_cstop,dipole_2d,&dipole2d,&rpi,&sym_axis);
+	  if (rp.x>0.010/10.0*(25+0.5-n_cstop/2.0))
+	    multipole_stack_append(&msi_cstop_half,dipole_2d,&dipole2d,&rp,&sym_axis);
+	  rpi.z = -2*(im+1)*pars->t_si;
+	  if (k==n_cstop/2)
+	    multipole_stack_append(&msi_cstop_vac,dipole_2d,&dipole2d_vac,&rp,&sym_axis);
+	  multipole_stack_append(&msi_cstop,dipole_2d,&dipole2d,&rpi,&sym_axis);
+	  if (rp.x>0.010/10.0*(25+0.5-n_cstop/2.0))
+	    multipole_stack_append(&msi_cstop_half,
+				   dipole_2d,&dipole2d,&rp,&sym_axis);
+	}
+	rpi.z = 2*(im+1)*pars->t_si;
+	if (k==n_cstop/2)
+	  multipole_stack_append(&msi_cstop_vac,dipole_2d,&dipole2d_vac,&rp,&sym_axis);
+	multipole_stack_append(&msi_cstop,dipole_2d,&dipole2d,&rpi,&sym_axis);
+	if (rp.x>0.010/10.0*(25+0.5-n_cstop/2.0))
+	  multipole_stack_append(&msi_cstop_half,
+				 dipole_2d,&dipole2d,&rp,&sym_axis);
+      }
+
+      // construct field structure due to clocks
+      sym_axis.x=1;
+      sym_axis.y=0;
+      sym_axis.z=0;
+      int n_clocks=100; // this should be even
+      // change this back
+      for (k=0;k<n_clocks;k++) {
+	cpvec(&origin,&rp);
+	rp.y=0.010/10.0*(k+0.5-n_clocks/2.0);
+	multipole_stack_append(&msi_clocks,dipole_2d,&dipole2d_clocks,&rp,&sym_axis);
+	for (im=0;im<5;im++) {
+	  cpvec(&rp,&rpi);
+	  rpi.z = 2*(im+1)*pars->t_si;
+	  multipole_stack_append(&msi_clocks,dipole_2d,&dipole2d_clocks,&rpi,&sym_axis);
+	  rpi.z = -2*(im+1)*pars->t_si;
+	  multipole_stack_append(&msi_clocks,dipole_2d,&dipole2d_clocks,&rpi,&sym_axis);
+	}
+	rpi.z = 2*(im+1)*pars->t_si;
+	multipole_stack_append(&msi_clocks,dipole_2d,&dipole2d_clocks,&rpi,&sym_axis);
+      }
+
+      // combine msi_cstop and msi_channel into one msi
+      
+      multipole_stack_cat(&msi_test,msi_channel);
+      multipole_stack_cat(&msi_test,msi_cstop);
+      //      multipole_stack_cat(&msi_test,msi_cstop_vac);
+      multipole_stack_cat(&msi_test,msi_clocks);
+      
+      //      multipole_stack_cat(&msi_test,msi_cstop_half);
+
+    }
+    // test the algorithm
+    {
+      multipole_stack *msi=msi_test;
+      int iter=0;
+      FILE *fp=fopen("xx.tnt","w");
+
+      //      fprintf(fp,"data\nset\tz[cm]\tx[cm]\ty[cm]\tdeltaX[cm]\t|E|\tpotential\tt_col\tsigma_drift\n");
+      fprintf(fp,"data\nx0[cm]\ty0[cm]\tx_in[cm]\ty_in[cm]\n");
+
+      for (j=0;j<nresp;j++) {
+
+	if (0) {
+	  ps.x=x[j];
+	  ps.y=0.025/10.0;
+
+	  ps.x=0;
+	  ps.y=x[j];
+	  ps.z=z[0];
+
+	  drift(&ps,&ds[j],pars,msi,e1,n_vals,FORWARD,&iter);
+	  for (i=0;i<=iter;i++) {
+	    fprintf(fp,"%d %g %g %g %g %g %g %g %g\n",1,
+		    ds[j].pos[i].z,ds[j].pos[i].x,ds[j].pos[i].y,
+		    ps.x-x[j],ds[j].emag[i],ds[j].potential[i],ds[j].tcol[i],
+		    ds[j].sigma_resp[i]);
+	  }
+	}
+	// rather than doing backward traces, better write something to find
+	// saddle points constrained to a plane. Otherwise these backward traces
+	// will always be unstable (field lines may connect them to the front
+	// side rather than the back side. a sensible way to do this may be to
+	// start with a "forward" drift from a location close to the desired
+	// location.
+
+	{
+	  vec ps1,ps2,ps3;
+	  vec start1,start2,start3;
+	  int k;
+	  int nsample=100;
+	  int yval,xval;
+
+	  if (0) {
+	  for (yval=0;yval<3;yval++) {
+	    for (k=0;k<nsample;k++) {
+	      // space the samples uniformly between +/-(p/2-10nm)
+	      // and start within p/10 of the nominal border
+	      // as usual, choose a z value of 20um from channel
+	      cpvec(&origin,&ps1);
+	      cpvec(&origin,&ps2);
+	      ps1.x = (2*k/(1.0*nsample-1)-1)*5*(0.010/10.0)/2; // span 5 pixels
+	      ps1.x = (2*k/(1.0*nsample-1))*1.5*(0.010/10.0)/2; // span 5 pixels
+	      ps2.x = ps1.x;
+	      ps1.y = 0.010/10.0*(yval + 0.5 + 0.40);
+	      ps2.y = ps1.y + 0.010/10.0*(-0.80);
+
+	      ps1.z = 0.02/10.0;
+	      ps2.z = ps1.z;
+	      if (!multipole_stack_locate_saddle(&ps1,&ps2,&ps3,BND_ROW,pars,e1,msi)) {
+		fprintf(stderr,"%s\n",show_vector("cusp",&ps3));
+		fprintf(fp,"%g %g %g %g\n",
+			0.5*(ps1.x+ps2.x),
+			0.5*(ps1.y+ps2.y),ps3.x,ps3.y);
+		// replicate for -x case
+		fprintf(fp,"%g %g %g %g\n",
+			-0.5*(ps1.x+ps2.x),
+			0.5*(ps1.y+ps2.y),-ps3.x,ps3.y);
+	      }
+	    }
+	  }
+	  }
+
+	  for (xval=-5;xval<5;xval++) {
+	    for (k=0;k<nsample/10;k++) {
+	      // space the samples uniformly between +/-(p/2-10nm)
+	      // and start within p/10 of the nominal border
+	      // as usual, choose a z value of 20um from channel
+	      cpvec(&origin,&ps1);
+	      cpvec(&origin,&ps2);
+	      ps1.x = 0.010/10.0*(xval + 0.5 + 0.60);
+	      ps2.x = ps1.x + 0.010/10.0*(-1.20);
+
+	      ps1.y = (2*k/(1.0*nsample-1)-1)*5*(0.010/10.0)/2; // span 5 pixels
+	      ps1.y = (2*k/(1.0*nsample-1))*1.5*(0.010/10.0)/2; // span 5 pixels
+	      ps2.y = ps1.y;
+	      ps1.z = 0.01/10.0;
+	      ps2.z = ps1.z;
+
+	      // drift2pix(&ps1,pars,msi,e1,n_vals);
+	      // this here generates field distortion near charge 
+	      // collected in the channel
+	      {
+		int x,y,fx,fy;
+		vec ps1,ps2,ps3;
+		cpvec(&origin,&ps1);
+		cpvec(&origin,&ps2);
+		cpvec(&origin,&ps3);
+		ps1.z=ps2.z=ps3.z=0.01;
+		x=-10;		
+		y=0;
+		FILE *bnd_fp=fopen("column_boundaries.tnt","w");
+		fprintf(bnd_fp,"DATA\nxpix\typix\txbnd[cm]\tybnd[cm]\n");
+		//		for (x=0;x<=5;x++) {
+		// for (y=0;y<=5;y++) {
+		for (x=2;x<=2;x++) {
+		  for (y=5;y<=5;y++) {
+		    for (fy=0;fy<100;fy++) {
+		      ps1.x = ps2.y = y*0.01/10.0+(fy/(100.0-1)-0.5)*0.001;
+		      target_pix(x,y,&ps1,pars,msi,e1,n_vals,BND_COLUMN);
+		      target_pix(x+1,y,&ps2,pars,msi,e1,n_vals,BND_COLUMN);
+		      //		  ps1.y = 0.005*(1-0.5)/10.0;
+		      //		  ps1.y = 0.005*(1+0.5)/10.0;
+		      vec pinch;
+		      if (!multipole_stack_pinch(&ps1,&ps2,&pinch,
+						 BND_COLUMN,pars,e1,msi)) {
+			int x1,y1;
+			drift2pix(&pinch,pars,msi,e1,n_vals,&x1,&y1);
+			fprintf(bnd_fp,"%f %d %g %g\n",0.5*(2*x+1),y1,pinch.x,pinch.y);
+			fflush(bnd_fp);
+		      }
+		    }
+		  }
+		} 
+		fclose(bnd_fp);
+		exit(0);
+		
+		bnd_fp=fopen("row_boundaries.tnt","w");
+		fprintf(bnd_fp,"DATA\nxpix\typix\txbnd[cm]\tybnd[cm]\n");
+		for (y=0;y<=5;y++) {
+		  for (x=0;x<=5;x++) {
+		    for (fx=0;fx<100;fx++) {
+		      ps1.x = ps2.x = x*0.01/10.0+(fx/(100.0-1)-0.5)*0.001;
+		      target_pix(x,y,&ps1,pars,msi,e1,n_vals,BND_ROW);
+		      target_pix(x,y+1,&ps2,pars,msi,e1,n_vals,BND_ROW);
+		      //		  ps1.y = 0.005*(1-0.5)/10.0;
+		      //		  ps1.y = 0.005*(1+0.5)/10.0;
+		      vec pinch;
+		      if (!multipole_stack_pinch(&ps1,&ps2,&pinch,
+						 BND_ROW,pars,e1,msi)) {
+			int x1,y1;
+			drift2pix(&pinch,pars,msi,e1,n_vals,&x1,&y1);
+			fprintf(bnd_fp,"%d %f %g %g\n",x1,0.5*(2*y+1),pinch.x,pinch.y);
+			fflush(bnd_fp);
+		      }
+		    }
+		  }
+		} 
+		fclose(bnd_fp);
+		exit(0);
+	      }
+	      // this here generates something like a midline charge redistribution flat field response
+	      {
+		int x,y;
+		vec ps1,ps2,ps3;
+		cpvec(&origin,&ps1);
+		cpvec(&origin,&ps2);
+		cpvec(&origin,&ps3);
+		ps1.z=ps2.z=ps3.z=0.01;
+		x=-10;		y=0;
+		for (x=-10;x<=10;x++) {
+		  target_pix(x,y,&ps1,pars,msi,e1,n_vals,BND_COLUMN);
+		  target_pix(x+1,y,&ps2,pars,msi,e1,n_vals,BND_COLUMN);
+		  vec pinch;
+		  if (!multipole_stack_pinch(&ps1,&ps2,&pinch,
+					     BND_EITHER,pars,e1,msi)) {
+		    fprintf(stderr,"(x,xbnd)=(%f,%f)\n",(float)x,pinch.x);
+		  }
+		}
+		exit(0);
+		target_pix(x,y,&ps3,pars,msi,e1,n_vals,BND_COLUMN);
+		drift2pix(&ps1,pars,msi,e1,n_vals,&x,&y);
+		fprintf(stderr,"p1: %d %d\n",x,y);
+		drift2pix(&ps2,pars,msi,e1,n_vals,&x,&y);
+		fprintf(stderr,"p2: %d %d\n",x,y);
+		drift2pix(&ps3,pars,msi,e1,n_vals,&x,&y);
+		fprintf(stderr,"p3: %d %d\n",x,y);
+		{
+		  vec pinch;
+		  if (!multipole_stack_pinch(&ps1,&ps2,&pinch,
+					     BND_EITHER,pars,e1,msi)) {
+		    fprintf(stderr,"multipole_stack_pinch returns 0\n");
+		    fprintf(stderr,"%s\n",show_vector("pinch",&pinch));
+		  } else {
+		    fprintf(stderr,"multipole_stack_pinch returns 1\n");
+		    fprintf(stderr,"%s\n",show_vector("pinch",&pinch));
+		  }
+		  if (!multipole_stack_pinch(&ps2,&ps3,&pinch,
+					     BND_EITHER,pars,e1,msi)) {
+		    fprintf(stderr,"multipole_stack_pinch returns 0\n");
+		    fprintf(stderr,"%s\n",show_vector("pinch",&pinch));
+		  } else {
+		    fprintf(stderr,"multipole_stack_pinch returns 1\n");
+		    fprintf(stderr,"%s\n",show_vector("pinch",&pinch));
+		  }
+		}
+		exit(0);
+		multipole_stack_locate_saddle(&ps1,&ps2,&ps3,
+					      BND_EITHER,pars,e1,msi); 
+		fprintf(stderr,"%s\n",show_vector("cusp",&ps3));
+	      }
+
+	      if (!multipole_stack_locate_saddle(&ps1,&ps2,&ps3,BND_COLUMN,pars,e1,msi)) {
+		fprintf(stderr,"%s\n",show_vector("cusp",&ps3));
+		fprintf(fp,"%g %g %g %g\n",
+			0.5*(ps1.x+ps2.x),
+			0.5*(ps1.y+ps2.y),ps3.x,ps3.y);
+		// replicate for -y case
+		fprintf(fp,"%g %g %g %g\n",
+			0.5*(ps1.x+ps2.x),
+			-0.5*(ps1.y+ps2.y),ps3.x,-ps3.y);
+	      } else {
+		fprintf(stderr,"skipping %f,%f\n",0.5*(ps1.x+ps2.x),0.5*(ps1.y+ps2.y));
+	      }
+	    }
+	  }
+
+	  exit(0);
+
+	  // ps1 & ps2 are 2 positions straddling a pixel boundary.
+	  ps1.z=0.020/10.0;
+	  ps2.z=0.020/10.0;
+	  ps1.y=0.000/10.0;
+	  ps2.y=0.010/10.0;
+	  vec_add(&ps1,&ps2,&ps3);
+	  scalevec(&ps3,0.5);
+	  cpvec(&ps1,&start1);
+	  cpvec(&ps2,&start2);
+	  cpvec(&ps3,&start3);
+
+	  multipole_stack_locate_saddle(&ps1,&ps2,&ps3,BND_EITHER,pars,e1,msi);
+	  fprintf(stderr,"%s\n",show_vector("cusp",&ps3));
+	  exit(0);
+	  
+	  iter=0;
+	  drift(&ps1,&ds[j],pars,msi,e1,n_vals,FORWARD,&iter);
+	  fprintf(stderr,"%s ",show_vector("ps1",&start1));
+	  fprintf(stderr,"%s\n",show_vector("final",&ds[j].pos[iter-1]));
+	  fprintf(stderr,"pixel (%d,%d)\n",(int)floor((ds[j].pos[iter-1].x+0.0005)/0.001),(int)floor((ds[j].pos[iter-1].y+0.0005)/0.001));
+	  iter=0;
+	  drift(&ps2,&ds[j],pars,msi,e1,n_vals,FORWARD,&iter);
+	  fprintf(stderr,"%s ",show_vector("ps2",&start2));
+	  fprintf(stderr,"%s\n",show_vector("final",&ds[j].pos[iter-1]));
+	  fprintf(stderr,"pixel (%d,%d)\n",(int)floor((ds[j].pos[iter-1].x+0.0005)/0.001),(int)floor((ds[j].pos[iter-1].y+0.0005)/0.001));
+	  iter=0;
+	  drift(&ps3,&ds[j],pars,msi,e1,n_vals,FORWARD,&iter);
+	  fprintf(stderr,"%s ",show_vector("ps3",&start3));
+	  fprintf(stderr,"%s\n",show_vector("final",&ds[j].pos[iter-1]));
+	  fprintf(stderr,"pixel (%d,%d)\n",(int)floor((ds[j].pos[iter-1].x+0.0005)/0.001),(int)floor((ds[j].pos[iter-1].y+0.0005)/0.001));
+	  exit(0);
+	  //	  if (pinch(&ps1,&ps2,msi)) {
+	  //	  } else {
+	    // first guesses don't straddle pixel boundary
+	  //	  }
+	}
+	
+	if (0) {
+	  // backward trace - top
+	  ps.x=x[j];
+	  ps.y=0.005/10.0;
+	  ps.z=0;
+	  drift(&ps,&ds[j],pars,msi,e1,n_vals,BACKWARD,&iter);
+	  for (i=0;i<=iter;i++) {
+	    fprintf(fp,"%d %g %g %g %g %g %g %g %g\n",2,
+		    ds[j].pos[i].z,ds[j].pos[i].x,ds[j].pos[i].y,
+		    ps.x-x[j],ds[j].emag[i],ds[j].potential[i],ds[j].tcol[i],
+		    ds[j].sigma_resp[i]);
+	  }
+	  // bottom
+	  ps.x=x[j];
+	  ps.y=-0.005/10.0;
+	  ps.z=0;
+	  drift(&ps,&ds[j],pars,msi,e1,n_vals,BACKWARD,&iter);
+	  for (i=0;i<=iter;i++) {
+	    fprintf(fp,"%d %g %g %g %g %g %g %g %g\n",2,
+		    ds[j].pos[i].z,ds[j].pos[i].x,ds[j].pos[i].y,
+		    ps.x-x[j],ds[j].emag[i],ds[j].potential[i],ds[j].tcol[i],
+		    ds[j].sigma_resp[i]);
+	  }
+	  // left & right
+	  ps.x=-0.005/10.0;
+	  ps.y=x[j];
+	  ps.z=0;
+	  drift(&ps,&ds[j],pars,msi,e1,n_vals,BACKWARD,&iter);
+	  for (i=0;i<=iter;i++) {
+	    fprintf(fp,"%d %g %g %g %g %g %g %g %g\n",2,
+		    ds[j].pos[i].z,ds[j].pos[i].x,ds[j].pos[i].y,
+		    ps.x-x[j],ds[j].emag[i],ds[j].potential[i],ds[j].tcol[i],
+		    ds[j].sigma_resp[i]);
+	  }
+	  ps.x=+0.005/10.0;
+	  ps.y=x[j];
+	  ps.z=0;
+	  drift(&ps,&ds[j],pars,msi,e1,n_vals,BACKWARD,&iter);
+	  for (i=0;i<=iter;i++) {
+	    fprintf(fp,"%d %g %g %g %g %g %g %g %g\n",2,
+		    ds[j].pos[i].z,ds[j].pos[i].x,ds[j].pos[i].y,
+		    ps.x-x[j],ds[j].emag[i],ds[j].potential[i],ds[j].tcol[i],
+		    ds[j].sigma_resp[i]);
+	  }
+	}
+	if (0) {
+	  ps.y=0.0025/10;
+	  ps.x=x[j];
+	  ps.z=z[0];
+	  drift(&ps,&ds[j],pars,msi,e1,n_vals,FORWARD,&iter);
+	  for (i=0;i<=iter;i++) {
+	    fprintf(fp,"%d %g %g %g %g %g %g %g %g\n",1,
+		    ds[j].pos[i].z,ds[j].pos[i].x,ds[j].pos[i].y,
+		    ps.x-x[j],ds[j].emag[i],ds[j].potential[i],ds[j].tcol[i],
+		    ds[j].sigma_resp[i]);
+	  }
+
+	  ps.y=0.005/10;
+	  ps.x=x[j];
+	  ps.z=z[0];
+	  drift(&ps,&ds[j],pars,msi,e1,n_vals,FORWARD,&iter);
+	  for (i=0;i<=iter;i++) {
+	    fprintf(fp,"%d %g %g %g %g %g %g %g %g\n",1,
+		    ds[j].pos[i].z,ds[j].pos[i].x,ds[j].pos[i].y,
+		    ps.x-x[j],ds[j].emag[i],ds[j].potential[i],ds[j].tcol[i],
+		    ds[j].sigma_resp[i]);
+	  }
+	}
+      }
+    }
+    exit(0);
+
+    goto cleanup;
+
+    // effective postion of the dipole
+    cpvec(&origin,&rp);
+
+    FILE *fp=fopen("t.tnt","w");
+    fprintf(fp,"data\nset\tz[cm]\tx[cm]\tdeltaX[cm]\t|Ex|\t|Ez|\n");
+    for (j=0;j<nresp;j++) {
+      ps.y = 0.0;
+      ps.x = x[j];
+      ps.z = z[0];
+      float emag;
+      int iter=0;
+      do {
+	int im,cc;
+
+	int i = floor( (ps.z - pars->t_si)/dz );
+	if (i>=n_vals) i=n_vals-1;
+	if (i<1) i=1;
+
+	if (iter<n_vals) {
+	  cpvec(&ps,&ds[j].pos[iter]);
+	}
+
+	cpvec(&origin,&field3d);
+
+	for (cc=0;cc<1;cc++) {
+
+	  cpvec(&origin,&rp);
+	  rp.x=(cc-0)*0.001;
+
+	  {
+	  
+	  }
+
+	  dipole_3d(&ps,&dipole3d,&rp,NULL,&field3di);
+	  vec_add(&field3d,&field3di,&field3d);
+
+	  for (im=0;im<5;im++) {
+
+	    cpvec(&rp,&rpi);
+
+	    rpi.z = 2*(im+1)*pars->t_si;
+	    dipole_3d(&ps,&dipole3d,&rpi,NULL,&field3di);
+	    vec_add(&field3d,&field3di,&field3d);
+
+	    rpi.z = -2*(im+1)*pars->t_si;
+	    dipole_3d(&ps,&dipole3d,&rpi,NULL,&field3di);
+	    vec_add(&field3d,&field3di,&field3d);
+
+	  }
+	}
+
+	rpi.z = 2*(im+1)*pars->t_si;
+	dipole_3d(&ps,&dipole3d,&rpi,NULL,&field3di);
+	vec_add(&field3d,&field3di,&field3d);
+
+	if (0) {
+	  // add in the effect of collected charge in the channel, position 5E-4.
+	  cpvec(&origin,&rp);
+	  rp.x = 5e-4;
+
+	  dipole_3d(&ps,&dipole3d,&rp,NULL,&field3di);
+	  vec_add(&field2d,&field3di,&field2d);
+	
+	  vec sym_axis={0.0,1.0,0.0};
+
+	  for (im=0;im<5;im++) {
+
+	    cpvec(&rp,&rpi);
+
+	    rpi.z = 2*(im+1)*pars->t_si;
+	    dipole_3d(&ps,&dipole3d,&rpi,NULL,&field3di);
+	    vec_add(&field2d,&field3di,&field2d);
+	  
+	    rpi.z = -2*(im+1)*pars->t_si;
+	    dipole_2d(&ps,&dipole3d,&rpi,&sym_axis,&field3di);
+	    vec_add(&field2d,&field3di,&field2d);
+	  
+	  }
+	}
+
+
+	// now compute the new position.
+	// compute i from ps.z
+
+	emag=sqrt(pow(field3d.x,2)+
+		  pow(field3d.z+0.5*(e1[i-1]+e1[i]),2));
+	float theta=atan2(field3d.x,field3d.z+0.5*(e1[i-1]+e1[i]));
+
+
+	if (0) {
+	  fprintf(stderr,"%s\n",show_vector("sample",&ps));
+	  fprintf(stderr,"%s\n",show_vector("field",&field3d));
+	  fprintf(stderr,"emag: %f\n",emag);
+	  exit(0);
+	}
+
+      if (fabs(theta) < M_PI/180.0) {
+	ps.x -= dz*tan(theta);
+	ps.z -= dz;
+      } else {
+	ps.x -= dz*sin(theta);
+	ps.z -= dz*cos(theta);
+      }
+      //      fprintf(fp,"%d %g %g %g %g\n",1,ps.z,ps.x,ps.x-x[j],emag);
+      fprintf(fp,"%d %g %g %g %g %g\n",1,ps.z,ps.x,ps.x-x[j],
+	      sqrt(pow(field3d.x,2)),
+	      sqrt(pow(field3d.z+0.5*(e1[i-1]+e1[i]),2)));
+      printf("%g %g %g\n",ps.z,ps.x,emag);
+      iter++;
+    } while ((ps.z > 5e-5) && (ps.z < pars->t_si));
+    exit(0);
+    printf("no no\n");
+  }
+  printf("no no\n");
+  goto cleanup;
+
+  // reset rp & rpi
+  cpvec(&origin,&rp);
+  cpvec(&origin,&rpi);
+
+  for (j=0;j<nresp;j++) {
+    // this is for the potentials set up by the clocks
+    ps.y = 0.0;
+    ps.x = x[j];
+    ps.z = z[0];
+    float emag;
+    int iter=0;
+    do {
+      int im,cc;
+
+      int i = floor( (ps.z - pars->t_si)/dz );
+      if (i>=n_vals) i=n_vals-1;
+      if (i<1) i=1;
+
+
+      if (iter<n_vals) {
+	cpvec(&ps,&ds[j].pos[iter]);
+      }
+      
+      cpvec(&origin,&field2d);
+
+      // 3:1 aspect ratio for the section sampled:
+      // 3x the number of dipoles over the number of diples
+      // in the sampled region.
+
+      vec sym_axis={0.0,1.0,0.0};
+
+      for (cc=0;cc<=60;cc++) {
+
+	cpvec(&origin,&rp);
+	rp.x=(30-cc)*0.001;
+
+	dipole_2d(&ps,&dipole2d_clocks,&rp,&sym_axis,&field2di);
+	vec_add(&field2d,&field2di,&field2d);
+	
+	for (im=0;im<5;im++) {
+
+	  cpvec(&rp,&rpi);
+
+	  rpi.z = 2*(im+1)*pars->t_si;
+	  dipole_2d(&ps,&dipole2d_clocks,&rpi,&sym_axis,&field2di);
+	  vec_add(&field2d,&field2di,&field2d);
+	  
+	  rpi.z = -2*(im+1)*pars->t_si;
+	  dipole_2d(&ps,&dipole2d_clocks,&rpi,&sym_axis,&field2di);
+	  vec_add(&field2d,&field2di,&field2d);
+	  
+	}
+      }
+
+      rpi.z = 2*(im+1)*pars->t_si;
+      dipole_2d(&ps,&dipole2d_clocks,&rpi,&sym_axis,&field2di);
+      vec_add(&field2d,&field2di,&field2d);
+
+      // add in the effect of collected charge in the channel, position 5E-4.
+      cpvec(&origin,&rp);
+      rp.x = 5e-4;
+
+      dipole_3d(&ps,&dipole3d,&rp,NULL,&field3di);
+      vec_add(&field2d,&field3di,&field2d);
+	
+      for (im=0;im<5;im++) {
+
+	cpvec(&rp,&rpi);
+
+	rpi.z = 2*(im+1)*pars->t_si;
+	dipole_3d(&ps,&dipole3d,&rpi,NULL,&field3di);
+	vec_add(&field2d,&field3di,&field2d);
+	  
+	rpi.z = -2*(im+1)*pars->t_si;
+	dipole_2d(&ps,&dipole3d,&rpi,&sym_axis,&field3di);
+	vec_add(&field2d,&field3di,&field2d);
+	  
+      }
+      
+
+      // now compute the new position.
+      // compute i from ps.z
+
+      emag=sqrt(pow(field2d.x,2)+
+		pow(field2d.z+0.5*(e1[i-1]+e1[i]),2));
+      float theta=atan2(field2d.x,field2d.z+0.5*(e1[i-1]+e1[i]));
+
+      if (fabs(theta) < M_PI/180.0) {
+	ps.x -= dz*tan(theta);
+	ps.z -= dz;
+      } else {
+	ps.x -= dz*sin(theta);
+	ps.z -= dz*cos(theta);
+      }
+      fprintf(fp,"%d %g %g %g %g\n",2,ps.z,ps.x,ps.x-x[j],emag);
+      printf("%g %g %g\n",ps.z,ps.x,emag);
+      iter++;
+    } while ((ps.z > 5e-5) && (ps.z < pars->t_si));
+    printf("no no\n");
+  }
+  printf("no no\n");
+
+  // reset rp & rpi
+  cpvec(&origin,&rp);
+  cpvec(&origin,&rpi);
+
+  for (j=0;j<nresp;j++) {
+    ps.y = 0.0;
+    ps.x = x[j];
+    ps.z = z[0];
+    float emag;
+    int iter=0;
+    do {
+      int im,cc;
+
+      int i = floor( (ps.z - pars->t_si)/dz );
+      if (i>=n_vals) i=n_vals-1;
+      if (i<1) i=1;
+
+      if (iter<n_vals) {
+	cpvec(&ps,&ds[j].pos[iter]);
+      }
+      
+      cpvec(&origin,&field2d);
+
+      //      for (cc=0;cc<40;cc++) {
+
+      vec sym_axis={0.0,1.0,0.0};
+
+      for (cc=0;cc<=60;cc++) {
+
+	cpvec(&origin,&rp);
+	// this was how I was simulating the edge rolloff even without
+	// guard ring drain bias:
+	//	rp.x=(7-cc)*0.001;
+	rp.x=(30-cc)*0.001;
+
+	dipole_2d(&ps,&dipole2d,&rp,&sym_axis,&field2di);
+	vec_add(&field2d,&field2di,&field2d);
+	
+	for (im=0;im<5;im++) {
+
+	  cpvec(&rp,&rpi);
+
+	  rpi.z = 2*(im+1)*pars->t_si;
+	  dipole_2d(&ps,&dipole2d,&rpi,&sym_axis,&field2di);
+	  vec_add(&field2d,&field2di,&field2d);
+	  
+	  rpi.z = -2*(im+1)*pars->t_si;
+	  dipole_2d(&ps,&dipole2d,&rpi,&sym_axis,&field2di);
+	  vec_add(&field2d,&field2di,&field2d);
+	  
+	}
+      }
+
+      rpi.z = 2*(im+1)*pars->t_si;
+      dipole_2d(&ps,&dipole2d,&rpi,&sym_axis,&field2di);
+      vec_add(&field2d,&field2di,&field2d);
+
+      // add in the effect of collected charge in the channel, position 5E-4.
+      cpvec(&origin,&rp);
+      rp.x = 5e-4;
+
+      dipole_3d(&ps,&dipole3d,&rp,NULL,&field3di);
+      vec_add(&field2d,&field3di,&field2d);
+	
+      for (im=0;im<5;im++) {
+
+	cpvec(&rp,&rpi);
+
+	rpi.z = 2*(im+1)*pars->t_si;
+	dipole_3d(&ps,&dipole3d,&rpi,NULL,&field3di);
+	vec_add(&field2d,&field3di,&field2d);
+	  
+	rpi.z = -2*(im+1)*pars->t_si;
+	dipole_2d(&ps,&dipole3d,&rpi,&sym_axis,&field3di);
+	vec_add(&field2d,&field3di,&field2d);
+	  
+      }
+
+      // now compute the new position.
+      // compute i from ps.z
+
+      emag=sqrt(pow(field2d.x,2)+
+		pow(field2d.z+0.5*(e1[i-1]+e1[i]),2));
+      float theta=atan2(field2d.x,field2d.z+0.5*(e1[i-1]+e1[i]));
+
+      if (fabs(theta) < M_PI/180.0) {
+	ps.x -= dz*tan(theta);
+	ps.z -= dz;
+      } else {
+	ps.x -= dz*sin(theta);
+	ps.z -= dz*cos(theta);
+      }
+      fprintf(fp,"%d %g %g %g %g\n",2,ps.z,ps.x,ps.x-x[j],emag);
+      printf("%g %g %g\n",ps.z,ps.x,emag);
+      iter++;
+    } while ((ps.z > 5e-5) && (ps.z < pars->t_si));
+    printf("no no\n");
+  }
+  printf("no no\n");
+
+  // reset rp & rpi
+  cpvec(&origin,&rp);
+  cpvec(&origin,&rpi);
+
+  vec sym_axis={0.0,1.0,0.0};
+  for (j=0;j<nresp;j++) {
+    ps.y = 0.0;
+    ps.x = x[j];
+    ps.z = z[0];
+    float emag;
+    int iter=0;
+    do {
+      int im;
+
+      int i = floor( (ps.z - pars->t_si)/dz );
+      if (i>=n_vals) i=n_vals-1;
+      if (i<1) i=1;
+
+      if (iter<n_vals) {
+	cpvec(&ps,&ds[j].pos[iter]);
+      }
+      
+      dipole_2d(&ps,&dipole2d_edge,&rp,&sym_axis,&field2d_edge);
+      for (im=0;im<5;im++) {
+	rpi.z = 2*(im+1)*pars->t_si;
+	dipole_2d(&ps,&dipole2d_edge,&rpi,&sym_axis,&field2di_edge);
+	vec_add(&field2d_edge,&field2di_edge,&field2d_edge);
+
+	rpi.z = -2*(im+1)*pars->t_si;
+	dipole_2d(&ps,&dipole2d_edge,&rpi,&sym_axis,&field2di_edge);
+	vec_add(&field2d_edge,&field2di_edge,&field2d_edge);
+
+      }
+
+      rpi.z = 2*(im+1)*pars->t_si;
+      dipole_2d(&ps,&dipole2d_edge,&rpi,&sym_axis,&field2di_edge);
+      vec_add(&field2d_edge,&field2di_edge,&field2d_edge);
+
+      // add in the effect of collected charge in the channel, position 5E-4.
+      cpvec(&origin,&rp);
+      rp.x = 5e-4;
+
+      dipole_3d(&ps,&dipole3d,&rp,NULL,&field3di);
+      vec_add(&field2d,&field3di,&field2d);
+	
+      for (im=0;im<5;im++) {
+
+	cpvec(&rp,&rpi);
+
+	rpi.z = 2*(im+1)*pars->t_si;
+	dipole_3d(&ps,&dipole3d,&rpi,NULL,&field3di);
+	vec_add(&field2d,&field3di,&field2d);
+	  
+	rpi.z = -2*(im+1)*pars->t_si;
+	dipole_2d(&ps,&dipole3d,&rpi,&sym_axis,&field3di);
+	vec_add(&field2d,&field3di,&field2d);
+	  
+      }
+
+      // now compute the new position.
+      // compute i from ps.z
+
+      emag=sqrt(pow(field2d_edge.x,2)+
+		pow(field2d_edge.z+0.5*(e1[i-1]+e1[i]),2));
+      float theta=atan2(field2d_edge.x,field2d_edge.z+0.5*(e1[i-1]+e1[i]));
+
+      if (fabs(theta) < M_PI/180.0) {
+	ps.x -= dz*tan(theta);
+	ps.z -= dz;
+      } else {
+	ps.x -= dz*sin(theta);
+	ps.z -= dz*cos(theta);
+      }
+      fprintf(fp,"%d %g %g %g %g\n",3,ps.z,ps.x,ps.x-x[j],emag);
+      printf("%g %g %g\n",ps.z,ps.x,emag);
+      iter++;
+    } while ((ps.z > 5e-5) && (ps.z < pars->t_si));
+    printf("no no\n");
+  }
+  printf("no no\n");
+
+  /* for (j=0;j<nresp;j++) { */
+  /*   if (0) */
+  /*   for (i=1;i<n_vals;i++) { */
+
+  /*     ps1.z = z[i]; */
+  /*     ps2.z = z[i]; */
+  /*     ps3.z = z[i]; */
+
+  /*     vec_diff(&ps1,&rp,&ps1); */
+  /*     if (ps1.z == 0) ps1.z += 1e-8; */
+  /*     if (ps2.z == 0) ps2.z += 1e-8; */
+  /*     if (ps3.z == 0) ps3.z += 1e-8; */
+
+  /*     dipole_3d(&ps1,&dipole3d,&rp,&field3d); */
+  /*     dipole_2d(&ps2,&dipole2d,&rp,&field2d); */
+  /*     dipole_2d(&ps3,&dipole2d_edge,&rp,&field2d_edge); */
+
+  /*     { */
+  /* 	int im; */
+  /* 	// expand in images */
+  /* 	// postion of the image (equipotential at the window) */
+  /* 	rpi.x = rpi.y = 0.0; */
+  /* 	for (im=0;im<5;im++) { */
+  /* 	  rpi.z = 2*(im+1)*pars->t_si; */
+  /* 	  dipole_3d(&ps1,&dipole3d,&rpi,&field3di); */
+  /* 	  vec_add(&field3d,&field3di,&field3d); */
+  /* 	  rpi.z = -2*(im+1)*pars->t_si; */
+  /* 	  dipole_3d(&ps1,&dipole3d,&rpi,&field3di); */
+  /* 	  vec_add(&field3d,&field3di,&field3d); */
+  /* 	} */
+  /* 	// same thing for the 2d dipole */
+  /* 	for (im=0;im<5;im++) { */
+  /* 	  rpi.z = 2*(im+1)*pars->t_si; */
+  /* 	  dipole_2d(&ps2,&dipole2d,&rpi,&field2di); */
+  /* 	  vec_add(&field2d,&field2di,&field2d); */
+  /* 	  rpi.z = -2*(im+1)*pars->t_si; */
+  /* 	  dipole_2d(&ps2,&dipole2d,&rpi,&field2di); */
+  /* 	  vec_add(&field2d,&field2di,&field2d); */
+  /* 	} */
+  /* 	// same thing for the 2d dipole edge */
+  /* 	if (1) { */
+  /* 	  for (im=0;im<15;im++) { */
+  /* 	    rpi.z = 2*(im+1)*pars->t_si; */
+  /* 	    dipole_2d(&ps3,&dipole2d_edge,&rpi,&field2di_edge); */
+  /* 	    vec_add(&field2d_edge,&field2di_edge,&field2d_edge); */
+  /* 	    rpi.z = -2*(im+1)*pars->t_si; */
+  /* 	    dipole_2d(&ps3,&dipole2d_edge,&rpi,&field2di_edge); */
+  /* 	    vec_add(&field2d_edge,&field2di_edge,&field2d_edge); */
+  /* 	  } */
+  /* 	} else { */
+  /* 	  rpi.z = 2*pars->t_si; */
+  /* 	  dipole_2d(&ps3,&dipole2d_edge,&rpi,&field2di_edge); */
+  /* 	  vec_add(&field2d_edge,&field2di_edge,&field2d_edge); */
+  /* 	} */
+  /*     } */
+      
+  /*     // modify x component due to drift */
+  /*     ps1.x += dz*field3d.x/(field3d.z+0.5*(e1[i-1]+e1[i])); */
+  /*     ps2.x += dz*field2d.x/(field2d.z+0.5*(e1[i-1]+e1[i])); */
+  /*     ps3.x += dz*field2d_edge.x/(field2d_edge.z+0.5*(e1[i-1]+e1[i])); */
+
+  /*     printf("%d %g %g %g %g %g %g %g %g %g %g %g %g\n",i,z[i],e1[i],v1[i],field3d.z,field3d.x,e1[i]+field3d.z,field2d.z,field2d.x,e1[i]+field2d.z,ps1.x,ps2.x,ps3.x); */
+  /*   } */
+  /* } */
+
+  // remove prior to launch, possibly skip over the middle section
+  goto cleanup;
+  }
+
+
+  //  Estat_profile(e1,v1,n_vals,&tmp_pars,1000);
+  // copy over the doping density into the pars before it's overwritten
+  memcpy(pars->dp,dp,n_vals*sizeof(float));
+  // e2,v2 are field & potential profiles for a '1% filled well' config
+  memcpy(&tmp_pars,pars,sizeof(bi_ccd_pars));
+  if (0) {
+    // this approach showed a puzzling discontinuity across different
+    // values of bias. 
+    Estat_profile(e2,v2,n_vals,&tmp_pars,floor(0.01*100000));
+  } else {
+    // this approach (modeling trapped charge simply as a drop in the 
+    // n-channel doping 
+    if (0) {
+      // by altering the n-channel concentration
+      tmp_pars.N_f += 0.01*100000/(tmp_pars.s_f*pow(10e-4,2));
+    } else {
+      // or by altering the n-channel scale length (more physical)
+      tmp_pars.s_f += 0.01*100000/(tmp_pars.N_f*pow(10e-4,2));
+    }
+    Estat_profile(e2,v2,n_vals,&tmp_pars,0);
+  }
+
+  memcpy(&tmp_pars,pars,sizeof(bi_ccd_pars));
+  tmp_pars.N_bulk *= 1.01; // to simulate doping density gradient
+  // e3,v3 are field & potential profiles for a 1% variation in bulk doping density
+  Estat_profile(e3,v3,n_vals,&tmp_pars,0);
+  // e4,v4 are field & potential profiles for a 1% increase in overdep bias
+  memcpy(&tmp_pars,pars,sizeof(bi_ccd_pars));
+  //  tmp_pars.overdep_bias *= 1.01; // to simulate bias level variation
+  tmp_pars.overdep_bias += 0.01; // to simulate bias level variation
+  // (0.01 V/10um = 1 V/mm)
+  Estat_profile(e4,v4,n_vals,&tmp_pars,0);
+  //  // now need to 'fix' the potential array v4 so that the 
+  //  // potential profile difference is seen at the channel.
+  //  // leave e4 alone.
+  // with {e,v}{1,2,3}, align potentials at the end points and then
+  // subtract v1 from v{2,3} to compute the lateral field.
+  for (i=0;i<n_vals;i++) {
+    v2[i] += (v1[n_vals-1]-v2[n_vals-1])*i/(n_vals-1);
+    v3[i] += (v1[n_vals-1]-v3[n_vals-1])*i/(n_vals-1);
+    // except don't do this for v4.
+    // v4[i] += (v1[n_vals-1]-v4[n_vals-1])*i/(n_vals-1);
+  }
+
+  // do something special for the window bias gradient..
+  // zeroed out this test so that the overdep_bias is applied at the 
+  // clocks and not at the window.
+
+  if (0) {
+    // diagnostic output for the bias gradient case. simply output e1,v1 & e4,v4
+    int j;
+    FILE *FP;
+    FP=fopen("hey.qdp","w");
+    for (j=0;j<n_vals;j++) 
+      fprintf(FP,"%d %g %g %g %g %g %g %g %g\n",j,e1[j],v1[j],e2[j],v2[j],e3[j],v3[j],e4[j],v4[j]);
+    fclose(FP);
+  }
+
+  // end points of v{1,2,3} are now aligned.
+  // now integrate from the channel up to position z
+  // the quantities Int^z_0 {d(z)*(v{2,3}-v1)/(e1)} to compute the 
+  //     lateral drift due to doping density variation, and to channel
+  //     occupancy.
+  // first identify position of the potential minimum in v1:
+
+  {
+    if (0) {
+      // calculate by counting down..
+      i=n_vals-1;
+      lat_resp2[i]=0;
+      lat_resp3[i]=0;
+      lat_resp4[i]=0;
+      while (i--) {
+	if (e1[i]==0) {
+	  lat_resp2[i]=lat_resp2[i+1]+0;
+	  lat_resp3[i]=lat_resp3[i+1]+0;
+	  lat_resp4[i]=lat_resp4[i+1]+0;
+	} else {
+	  // in the following expressions, v is measured in volts;
+	  // e in volts/cm. The multiplier 1e2 ensures that the lat_resp 
+	  // arrays have units of mm^2.
+	  // A gradient with dimensions mm-1 is used to multiply
+	  // the lat_resp arrays to produce deflections measured in mm.
+	  // the additional factor of 100 cancels the 0.01 effects (both in 
+	  // channel population and in doping density)
+	  // full well effect:
+	  lat_resp2[i]=lat_resp2[i+1]-100*dz*1e2*(v2[i]-v1[i])/e1[i];
+	  // doping density effect: 
+	  lat_resp3[i]=lat_resp3[i+1]-100*dz*1e2*(v3[i]-v1[i])/e1[i];
+	  // bias gradient effect:
+	  lat_resp4[i]=lat_resp4[i+1]-100*dz*1e2*(v4[i]-v1[i])/e1[i];
+	}
+      }
+    } else {
+      // calculate by counting up..
+      i=0;
+
+      lat_resp2[i]=lat_resp3[i]=lat_resp4[i]=0;
+
+      for (i=1;i<n_vals;i++) {
+	if (e1[i]==0) {
+	  // full well effect:
+	  lat_resp2[i]=lat_resp2[i-1];
+	  // doping density effect: 
+	  lat_resp3[i]=lat_resp3[i-1];
+	  // bias gradient effect:
+	  lat_resp4[i]=lat_resp4[i-1];
+	} else {
+	  // full well effect:
+	  lat_resp2[i]=lat_resp2[i-1]+100*dz*1e2*(v2[i]-v1[i])/e1[i];
+	  // doping density effect: 
+	  lat_resp3[i]=lat_resp3[i-1]+100*dz*1e2*(v3[i]-v1[i])/e1[i];
+	  // bias gradient effect:
+ 	  lat_resp4[i]=lat_resp4[i-1]+100*dz*1e2*(v4[i]-v1[i])/e1[i];
+	  // changed the direction of this because it now treats for 
+	  // a different potential at the channel (e.g. clocks)
+	  lat_resp4[i]=lat_resp4[i-1]+100*dz*1e2*(v4[i]-v1[i])/e1[i];
+	}
+      }
+    }
+    {
+      // find the potential minimum to offset lat_resp2 as appropriate.
+      int   min_ix = n_vals-1000;
+      // use index for 1.0um from "channel"..
+      min_ix = floor( -(t_si-0.1/1e4)/dz );
+      float lat_resp3_offset=lat_resp3[min_ix];
+      float lat_resp2_offset=lat_resp2[min_ix];
+      float lat_resp4_offset=lat_resp4[n_vals-1];
+      lat_resp4_offset=lat_resp4[min_ix];
+
+      // pick out min_ix from the v1 profile..
+      float min_potential=1e10;
+      i=n_vals;
+      while (i--) {
+	if (min_potential>v1[i]) {
+	  min_potential=v1[i];
+	  min_ix=i;
+	}
+      }
+
+      min_ix--;
+
+      lat_resp3_offset=lat_resp3[min_ix];
+      lat_resp2_offset=lat_resp2[min_ix];
+      lat_resp4_offset=lat_resp4[min_ix];
+
+      i=n_vals;
+      while (i--) {
+	if (i>min_ix) {
+	  lat_resp3[i]=0;
+	  lat_resp2[i]=0;
+	  lat_resp4[i]=0;
+	} else {
+	  lat_resp3[i]-=lat_resp3_offset;
+	  lat_resp2[i]-=lat_resp2_offset;
+	  lat_resp4[i]-=lat_resp4_offset;
+	}
+      }
+    }
+    // continue to compute the lateral diffusion. 
+    // set the minimum collection time to that for ..
+    int min_e_index=0;
+    float min_e=0;
+
+    for (i=0;i<n_vals;i++) {
+      if (e1[i] < min_e) {
+	min_e_index=i;
+	min_e=e1[i];
+      }
+    }
+    // here output to stderr something about the electronic conditions
+
+    fprintf(stderr,
+	    "\tE_min (equiv): %9g kV cm-1\n"
+	    "\tV_clock:       %9g V\n",min_e/1000,v1[n_vals-1]);
+
+    i=n_vals-1;
+    tcol[i]=(dz/(min_e*mu_Si(min_e,T)));
+    //    tcol[i]=(dz/(min_e*mu_Si(0,T)));
+    while (i--) {
+      if (i>min_e_index) {
+	tcol[i]=(dz/(min_e*mu_Si(min_e,T)));
+	//	tcol[i]=(dz/(min_e*mu_Si(0,T)));
+      } else {
+	if (e1[i]+e1[i+1]>0) {
+	  tcol[i]=0.1;
+	} else {
+	  tcol[i]=2*dz/(e1[i]*mu_Si(e1[i],T)+e1[i+1]*mu_Si(e1[i+1],T));
+	  //	  tcol[i]=2*dz/(e1[i]*mu_Si(0,T)+e1[i+1]*mu_Si(0,T));
+	}
+      }
+      tcol[i]+=tcol[i+1];
+    }
+    i=n_vals;
+    while (i--) {
+      sigma[i]=sqrt(2*k*T/q*mu_Si(0,T)*tcol[i])*1e4; // in um.
+    }
+    // sigma[], tcol[], lat_resp{2,3,3}[] are ready to use.
+  }
+
+ cleanup:
+  // finally copy over potential gradients & sigma.
+  memcpy(pars->lateral_sigma,sigma,n_vals*sizeof(double));
+  memcpy(pars->chanpop_lat_resp,lat_resp2,n_vals*sizeof(double));
+  memcpy(pars->dopevar_lat_resp,lat_resp3,n_vals*sizeof(double));
+  memcpy(pars->biasvar_lat_resp,lat_resp4,n_vals*sizeof(double));
+  memcpy(pars->tcol,tcol,n_vals*sizeof(double));
+  memcpy(pars->e,e1,n_vals*sizeof(double));
+  memcpy(pars->v,v1,n_vals*sizeof(double));
+  memcpy(pars->z,z,n_vals*sizeof(float));
+  free(e1);  free(e2);  free(e3);  free(e4);
+  free(v1);  free(v2);  free(v3);  free(v4);
+  free(lat_resp2);  free(lat_resp3);  free(lat_resp4);
+  free(tcol);  free(sigma);
+  // remove before launch
+  //  exit(1);
+  return;
+}
+
