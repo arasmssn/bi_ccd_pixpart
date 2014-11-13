@@ -1,6 +1,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <string.h>
+#include "numrec/include/nr.h"
 #include "ray.h"
 #undef BI_CCD_FUNC
 #include "bi_ccd.h"
@@ -39,17 +41,19 @@ void dipolegrid_2d (vec *x_vec,vec *p_vec,vec *x0_vec,
 typedef struct {
   float dipole_moment; // product of the number of charges with 2x the position
                        // relative to the nearest equipotential surface
-  int   startpix;
+  float startpix;
   int   npix; // total number of pixels to be bounded uniformly. 
               // if npix=0 this is a single row or column at 
               // the lower boundary of that coordinate (units are pixels)
+  float theta; // angle of moment vector wrt normal, prior to any rotation by phi
   float phi; // angle corresponding to symmetry axis in degrees: 0=x, 90=y
 } dipole_array_struct;
 
 typedef struct {
   float dipole_moment; // product of the number of charges with 2x the position
                        // relative to the nearest equipotential surface
-  int   startpix_x,startpix_y;
+  float startpix_x,startpix_y;
+  float theta; // angle of moment vector wrt normal, prior to any rotation by phi
   float phi; // angle corresponding to symmetry axis in degrees: 0=x, 90=y
 } truncated_dipole_struct;
 
@@ -95,7 +99,7 @@ typedef struct {
 
 typedef struct {
   float limits[2]; // coordinates (in pixels) between which to find the boundary locus 
-  int pix; // boundary will be found between pix & pix+1
+  int pix; // boundary will be found between pix-1 & pix
   enum boundarytype way;
   int n_elem;
 } bnd_subset; // pixel boundary management
@@ -105,6 +109,21 @@ typedef struct {
   int nbnds;
   int n_bnd_chunk;
 } bnd_mgmt;
+
+typedef struct {
+  int pixcoord[2]; // coordinate pairs (in pixels) of pixel for which to find the boundary locus. corner will be found between pixcoord-1 & pixcoord
+  enum boundarytype way;
+  double *dist_along_edge;
+  double *edge_distortion;
+  vec corner[2];
+  int n_elem;
+} crn_subset; // pixel boundary management
+
+typedef struct {
+  crn_subset *crns;
+  int ncrns;
+  int n_crn_chunk;
+} crn_mgmt;
 
 typedef struct {
   float transv_pixcoord; // boundary will be found between pix & pix+1
@@ -118,6 +137,7 @@ typedef struct {
   int n_wid_chunk;
 } wid_mgmt;
 
+void locate_pix_edge (crn_subset *crn,ccd_runpars *ccd_rpp,multipole_stack *msi);
 
 char *usage_str=
   "usage::\n"
@@ -129,8 +149,12 @@ char *usage_str=
   "     -N  <bulk doping density> -t <device thickness> -B <backside bias>\n"
   "     -g <infinite_2d_dipole_array_moment0> <phi0>\n"
   "     -g <infinite_2d_dipole_array_moment1> <phi1>\n"
+  "     -G <infinite_2d_dipole_array_moment0> <subpix_phase0> <theta0> <phi0>\n"
+  "     -G <infinite_2d_dipole_array_moment1> <subpix_phase1> <theta1> <phi1>\n"
   "     -d <2d_dipole_array_moment0> <array_start0> <npix0> <phi0>\n"
   "     -d <2d_dipole_array_moment1> <array_start1> <npix1> <phi1> ..\n"
+  "     -D <2d_dipole_array_moment0> <array_startphase0> <npix0> <theta0> <phi0> ..\n"
+  "     -D <2d_dipole_array_moment1> <array_startphase1> <npix1> <theta1> <phi1> ..\n"
   "     -r <trunc_2d_dipole_moment0> <truncpix_x0> <truncpix_y0> <phi0>\n"
   "     -r <trunc_2d_dipole_moment1> <truncpix_x1> <truncpix_y1> <phi1>\n"
   "     -c <3d_dipole_moment0> <dipole0_pix_x> <dipole0_pix_y>\n"
@@ -139,6 +163,8 @@ char *usage_str=
   "     -S <slice1_startx> <slice_starty> <slice_stopx> <slice_stopy> <npts> ..\n"
   "     -b <bnd0_pixel> <bnd0_lo_lim> <bnd0_hi_lim> <bnd0_n_sample> <dir[x|y]>\n"
   "     -b <bnd1_pixel> <bnd1_lo_lim> <bnd1_hi_lim> <bnd1_n_sample> <dir[x|y]>..\n"
+  "     -k <crn0_pixel_x0> <crn0_pixel_y0> <crn0_n_sample> <dir[x|y]>\n"
+  "     -k <crn1_pixel_x0> <crn1_pixel_y0> <crn1_n_sample> <dir[x|y]>..\n"
   "     -w <width0_transv_pixelcoord> <w0_lo_lim> <w0_hi_lim> <dir[x|y]>\n"
   "     -w <width1_transv_pixelcoord> <w1_lo_lim> <w1_hi_lim> <dir[x|y]>..\n"
   "     -n <image pair count>\n";
@@ -200,6 +226,12 @@ int main(int argc,char *argv[]) {
   bnd.bnds=(bnd_subset*)
     malloc(bnd.n_bnd_chunk*sizeof(bnd_subset));
 
+  crn_mgmt crn;
+  crn.ncrns=0;
+  crn.n_crn_chunk=10;
+  crn.crns=(crn_subset*)
+    malloc(crn.n_crn_chunk*sizeof(crn_subset));
+
   ccd_runpars ccd_rp;
 
   ccd_rp.ccdpars.N_bulk       = 1e12;
@@ -235,12 +267,15 @@ int main(int argc,char *argv[]) {
 	if (argc<2) goto bad_args;
 	break;
       case 'S':
+      case 'b':
+      case 'D':
 	if (argc<6) goto bad_args; // 6 corresponds to 5 arguments following
 	break;
       case 'r':
       case 'd':
-      case 'b':
       case 'w':      
+      case 'k':
+      case 'G':
 	if (argc<5) goto bad_args; // 5 corresponds to 4 arguments following
 	break;
       case 'c':
@@ -331,6 +366,38 @@ int main(int argc,char *argv[]) {
 	}
 	bnd.nbnds++;
 	break;
+      case 'k':
+	// fill in the bnd_mgmt structure for later use
+	if (crn.ncrns >= crn.n_crn_chunk) {
+	  crn.n_crn_chunk *= 2;
+	  crn.crns=(crn_subset*)
+	    realloc(crn.crns,crn.n_crn_chunk*sizeof(crn_subset));
+	}
+	argc--;argv++;	crn.crns[crn.ncrns].pixcoord[0] = atoi(argv[0]);
+	argc--;argv++;	crn.crns[crn.ncrns].pixcoord[1] = atoi(argv[0]);
+	argc--;argv++;	crn.crns[crn.ncrns].n_elem      = atoi(argv[0]);
+	crn.crns[crn.ncrns].dist_along_edge=
+	  (double*)malloc(crn.crns[crn.ncrns].n_elem*sizeof(double));
+	crn.crns[crn.ncrns].edge_distortion=
+	  (double*)malloc(crn.crns[crn.ncrns].n_elem*sizeof(double));
+	argc--;argv++;	
+	switch (argv[0][0]) {
+	case 'x':	case 'X':	  
+	  crn.crns[crn.ncrns].way=BND_ROW;	  break;
+	case 'y':	case 'Y':	  
+	  crn.crns[crn.ncrns].way=BND_COLUMN;	  break;
+	default:
+	  fprintf(stderr,"scan direction specification for corner-to-corner "
+		  "boundary search needs to be specified as either x or y.\n"
+		  "x specifies determining boundary between adjacent "
+		  "rows (and a trace between [x,y] and [x+1,y])\n"
+		  "y specifies determining boundary between adjacent columns (and a trace between [x,y] and [x,y+1]).\n"
+		  "exiting..\n");
+	  exit(1);
+	  break;
+	}
+	crn.ncrns++;
+	break;
       case 'd':
 	if (dpam.ndpa >= dpam.n_dpa_chunk) {
 	  dpam.n_dpa_chunk *= 2;
@@ -339,8 +406,23 @@ int main(int argc,char *argv[]) {
 	}
 	// populate the next dipole_array_struct and increment counter
 	argc--;argv++;	dpam.dpas[dpam.ndpa].dipole_moment=atof(argv[0]);
-	argc--;argv++;	dpam.dpas[dpam.ndpa].startpix=atoi(argv[0]);
+	argc--;argv++;	dpam.dpas[dpam.ndpa].startpix=atof(argv[0]);
 	argc--;argv++;	dpam.dpas[dpam.ndpa].npix=atoi(argv[0]);
+	argc--;argv++;	dpam.dpas[dpam.ndpa].phi=atof(argv[0]);
+	dpam.dpas[dpam.ndpa].theta=0; // normal to surface
+	dpam.ndpa++;
+	break;
+      case 'D':
+	if (dpam.ndpa >= dpam.n_dpa_chunk) {
+	  dpam.n_dpa_chunk *= 2;
+	  dpam.dpas=(dipole_array_struct*)
+	    realloc(dpam.dpas,dpam.n_dpa_chunk*sizeof(dipole_array_struct));
+	}
+	// populate the next dipole_array_struct and increment counter
+	argc--;argv++;	dpam.dpas[dpam.ndpa].dipole_moment=atof(argv[0]);
+	argc--;argv++;	dpam.dpas[dpam.ndpa].startpix=atof(argv[0]);
+	argc--;argv++;	dpam.dpas[dpam.ndpa].npix=atoi(argv[0]);
+	argc--;argv++;	dpam.dpas[dpam.ndpa].theta=atof(argv[0]);
 	argc--;argv++;	dpam.dpas[dpam.ndpa].phi=atof(argv[0]);
 	dpam.ndpa++;
 	break;
@@ -357,6 +439,25 @@ int main(int argc,char *argv[]) {
 	// are not used yet. Perhaps when this works toward supporting
 	// truncated grids..
 	argc--;argv++;	dpgm.dpgs[dpgm.ndpg].phi=atof(argv[0]);
+	dpgm.dpgs[dpgm.ndpg].startpix=0; // aligned with nominal grid
+	dpgm.dpgs[dpgm.ndpg].theta=0; // normal to surface
+	dpgm.ndpg++;
+	break;
+      case 'G':
+	if (dpgm.ndpg >= dpgm.n_dpg_chunk) {
+	  dpgm.n_dpg_chunk *= 2;
+	  dpgm.dpgs=(dipole_array_struct*)
+	    realloc(dpgm.dpgs,dpgm.n_dpg_chunk*sizeof(dipole_array_struct));
+	}
+	// populate the next dipole_array_struct and increment counter
+	argc--;argv++;	dpgm.dpgs[dpgm.ndpg].dipole_moment=atof(argv[0]);
+	// dipole_array_struct is also used to designate an infinite 
+	// 2D dipole grid, except that parameters "startpix" and "npix"
+	// are not used yet. Perhaps when this works toward supporting
+	// truncated grids..
+	argc--;argv++;	dpgm.dpgs[dpgm.ndpg].startpix=atof(argv[0]);
+	argc--;argv++;	dpgm.dpgs[dpgm.ndpg].theta=atof(argv[0]);
+	argc--;argv++;	dpgm.dpgs[dpgm.ndpg].phi=atof(argv[0]);
 	dpgm.ndpg++;
 	break;
       case 'r':
@@ -367,9 +468,10 @@ int main(int argc,char *argv[]) {
 	}
 	// populate the next dipole_array_struct and increment counter
 	argc--;argv++;	tdpm.tdps[tdpm.ntdp].dipole_moment=atof(argv[0]);
-	argc--;argv++;	tdpm.tdps[tdpm.ntdp].startpix_x=atoi(argv[0]);
-	argc--;argv++;	tdpm.tdps[tdpm.ntdp].startpix_y=atoi(argv[0]);
+	argc--;argv++;	tdpm.tdps[tdpm.ntdp].startpix_x=atof(argv[0]);
+	argc--;argv++;	tdpm.tdps[tdpm.ntdp].startpix_y=atof(argv[0]);
 	argc--;argv++;	tdpm.tdps[tdpm.ntdp].phi=atof(argv[0]);
+	tdpm.tdps[tdpm.ntdp].theta=0; // normal to surface
 	tdpm.ntdp++;
 	break;
       case 'c':
@@ -525,8 +627,7 @@ int main(int argc,char *argv[]) {
 	vec step={0.01/10.0,0,0};
 	vec startpos;
 	cpvec(&step,&startpos);
-	// startpos will be the origin for now
-	scalevec(&startpos,(float)0.0);
+	scalevec(&startpos,(float)dps->startpix);
 
 	{
 	  float xc;
@@ -544,6 +645,9 @@ int main(int argc,char *argv[]) {
 	}
 	vec pos;
 	vec z_unit={0,0,1};
+	vec dipole_unit={cs*sin(dps->theta*deg),
+			 sn*sin(dps->theta*deg),
+			 cos(dps->theta*deg)};
 	vec z_image;
 	int each;
 
@@ -557,7 +661,8 @@ int main(int argc,char *argv[]) {
 	  cpvec(&startpos,&pos);
 	  pos.z = z_image.z;
 	  vec dipole2d;
-	  cpvec(&z_unit,&dipole2d);
+	  //	  cpvec(&z_unit,&dipole2d);
+	  cpvec(&dipole_unit,&dipole2d);
 	  scalevec(&dipole2d,dps->dipole_moment*xi_moment);
 	  multipole_stack_append(&msi,dipolegrid_2d,&dipole2d,&pos,&sym_axis);
 	}
@@ -592,6 +697,9 @@ int main(int argc,char *argv[]) {
 
 	vec pos;
 	vec z_unit={0,0,1};
+	vec dipole_unit={cs*sin(tdp->theta*deg),
+			 sn*sin(tdp->theta*deg),
+			 cos(tdp->theta*deg)};
 	vec z_image;
 	int each;
 
@@ -605,7 +713,8 @@ int main(int argc,char *argv[]) {
 	  cpvec(&tdp_pos,&pos);
 	  pos.z = z_image.z;
 	  vec dipole2d;
-	  cpvec(&z_unit,&dipole2d);
+	  // cpvec(&z_unit,&dipole2d);
+	  cpvec(&dipole_unit,&dipole2d);
 	  scalevec(&dipole2d,dps->dipole_moment*xi_moment);
 	  multipole_stack_append(&msi,trunc_dipole_2d,&dipole2d,&pos,&trunc_axis);
 	}
@@ -649,6 +758,9 @@ int main(int argc,char *argv[]) {
 	}
 	vec pos;
 	vec z_unit={0,0,1};
+	vec dipole_unit={cs*sin(dps->theta*deg),
+			 sn*sin(dps->theta*deg),
+			 cos(dps->theta*deg)};
 	vec z_image;
 	int each;
 
@@ -664,7 +776,8 @@ int main(int argc,char *argv[]) {
 	  ix=0;
 	  do { // do-while lets us insert individual 2d dipoles if npix=0
 	    vec dipole2d;
-	    cpvec(&z_unit,&dipole2d);
+	    //	    cpvec(&z_unit,&dipole2d);
+	    cpvec(&dipole_unit,&dipole2d);
 	    scalevec(&dipole2d,dps->dipole_moment*xi_moment);
 	    multipole_stack_append(&msi,dipole_2d,&dipole2d,&pos,&sym_axis);
 	    vec_add(&pos,&step,&pos);
@@ -890,6 +1003,180 @@ int main(int argc,char *argv[]) {
 	}
 	fclose(fffp);
       }
+
+      if (crn.ncrns>0) {
+	// compute corner-to-corner boundary locus
+	// compute the boundary locus
+
+	int crn_ix;
+	int gen_ix;
+	FILE *fgp,*ggp;
+	if (((fgp=fopen("trace.qdp","w"))==NULL) ||
+	    ((ggp=fopen("boundary_distort.txt","w"))==NULL)) {
+	  fprintf(stderr,"can't open file ..\nexiting\n");
+	  exit(1);
+	}
+
+	for (crn_ix=0;crn_ix<crn.ncrns;crn_ix++) {
+	  locate_pix_edge(&crn.crns[crn_ix],&ccd_rp,msi);
+	  fprintf(ggp,"# EDGE TRACE\n");
+	  fprintf(ggp,"x0=%g y0=%g x1=%g y1=%g n=%d\n",
+		  crn.crns[crn_ix].corner[0].x,
+		  crn.crns[crn_ix].corner[0].y,
+		  crn.crns[crn_ix].corner[1].x,
+		  crn.crns[crn_ix].corner[1].y,
+		  crn.crns[crn_ix].n_elem);
+	  
+	  for (gen_ix=0;gen_ix<crn.crns[crn_ix].n_elem;gen_ix++) {
+	    
+	    fprintf(ggp,"%d %g %g\n",
+		    gen_ix,
+		    crn.crns[crn_ix].dist_along_edge[gen_ix],
+		    crn.crns[crn_ix].edge_distortion[gen_ix]-
+		    crn.crns[crn_ix].pixcoord[(crn.crns[crn_ix].way==BND_ROW)?1:0]*
+		    0.01/10.0);
+
+	    if (crn.crns[crn_ix].way==BND_ROW) {
+	      fprintf(fgp,"%15g %15g\n",
+		      crn.crns[crn_ix].dist_along_edge[gen_ix],
+		      crn.crns[crn_ix].edge_distortion[gen_ix]);
+	    } else {
+	      fprintf(fgp,"%15g %15g\n",
+		      crn.crns[crn_ix].edge_distortion[gen_ix],
+		      crn.crns[crn_ix].dist_along_edge[gen_ix]);
+	    }
+	  }
+	}
+	exit(0);
+	/* FILE *fgp=fopen("sora.tnt","w"); */
+
+	/* if (old_style) { */
+	/*   fprintf(fgp,"data\n"); */
+	/*   fprintf(fgp,"xpix\t"); */
+	/*   fprintf(fgp,"ypix\t"); */
+	/*   fprintf(fgp,"xbnd[um]\t"); */
+	/*   fprintf(fgp,"ybnd[um]\n"); */
+	/* } else { */
+	/*   fprintf(fgp,"data\n"); */
+	/*   fprintf(fgp,"xpix\t"); */
+	/*   fprintf(fgp,"ypix\t"); */
+	/*   fprintf(fgp,"bnd_type\t"); */
+	/*   fprintf(fgp,"slice_ix\t"); */
+	/*   fprintf(fgp,"z[um]\t"); */
+	/*   fprintf(fgp,"xbnd[um]\t"); */
+	/*   fprintf(fgp,"ybnd[um]\t"); */
+	/*   fprintf(fgp,"delta x [um]\t"); */
+	/*   fprintf(fgp,"delta y [um]\t"); */
+	/*   fprintf(fgp,"|E|[v/cm]\t"); */
+	/*   fprintf(fgp,"potential [v]\t"); */
+	/*   fprintf(fgp,"tcol [s]\t"); */
+	/*   fprintf(fgp,"sigma [um]\n"); */
+	/* } */
+
+	/* for (crn_ix=0;crn_ix<crn.ncrns;crn_ix++) { */
+	/*   for (aim_ix=0;aim_ix<crn.crns[crn_ix].n_elem;aim_ix++) { */
+	/*     float t=aim_ix/((float)crn.crns[crn_ix].n_elem-1); */
+	/*     startx = starty = 0.0; */
+	/*     if (crn.crns[crn_ix].way == BND_COLUMN) { */
+	/*       //	      aim_x1=crn.crns[crn_ix].pix; */
+	/*       aim_x1=0; // dummy */
+	/*       aim_x2=aim_x1+1; */
+	/*       startx=aim_x1*0.01/10.0; */
+	/*       //	      aim_y1=(int)floor(crn.crns[crn_ix].limits[0]); */
+	/*       aim_y1=0; //dummy */
+	/*       aim_y2=aim_y1; */
+	/*       //	      starty=((1-t)*crn.crns[crn_ix].limits[0]+ */
+	/*       //		      t*crn.crns[crn_ix].limits[1])*0.01/10.0; */
+	/*     } else { */
+	/*       // crn.way is equal to BND_ROW */
+	/*       //	      aim_x1=(int)floor(crn.crns[crn_ix].limits[0]); */
+	/*       aim_x1=0; //dummy */
+	/*       aim_x2=aim_x1; */
+	/*       //	      startx=((1-t)*crn.crns[crn_ix].limits[0]+ */
+	/*       //		      t*crn.crns[crn_ix].limits[1])*0.01/10.0; */
+	/*       //	      aim_y1=crn.crns[crn_ix].pix; */
+	/*       aim_y1=0; //dummy */
+	/*       aim_y2=aim_y1+1; */
+	/*       starty=aim_y1*0.01/10.0; */
+	/*     } */
+
+	/*     vec ps={startx,starty,ccd_rp.ccdpars.z[0]}; */
+	/*     vec ps1,ps2,pinch; */
+
+	/*     cpvec(&ps,&ps1); */
+	/*     cpvec(&ps,&ps2); */
+
+	/*     target_pix(aim_x1,aim_y1,&ps1,&ccd_rp.ccdpars,msi,ccd_rp.ccdpars.e, */
+	/* 	       n_vals,crn.crns[crn_ix].way); */
+	/*     target_pix(aim_x2,aim_y2,&ps2,&ccd_rp.ccdpars,msi,ccd_rp.ccdpars.e, */
+	/* 	       n_vals,crn.crns[crn_ix].way); */
+
+	/*     if (multipole_stack_pinch(&ps1,&ps2,&pinch, */
+	/* 			      crn.crns[crn_ix].way, */
+	/* 			      &ccd_rp.ccdpars,ccd_rp.ccdpars.e, */
+	/* 			      msi) == -1) continue; */
+
+	/*     // finally determine which pixel along the other direction  */
+	/*     // this position maps to */
+	/*     int xf,yf; */
+	/*     drift2pix(&pinch,&ccd_rp.ccdpars,msi,ccd_rp.ccdpars.e,n_vals,&xf,&yf); */
+	/*     if (crn.crns[crn_ix].way == BND_COLUMN) { */
+	/*       xf = aim_x2; */
+	/*     } else { */
+	/*       yf = aim_y2; */
+	/*     } */
+	/*     if (old_style) { */
+	/*       fprintf(fgp,"%d %d %g %g\n",xf,yf,pinch.x*1e4,pinch.y*1e4); */
+	/*     } else { */
+	/*       // will output the entire ds trace */
+	/*       driftstruct ds; */
+	/*       vec pscpy; */
+	/*       int my_iter=0; */
+
+	/*       // allocate driftstruct */
+
+	/*       ds.sigma_resp=(double*)malloc(n_vals*sizeof(double)); */
+	/*       ds.tcol=(double*)malloc(n_vals*sizeof(double)); */
+	/*       ds.emag=(double*)malloc(n_vals*sizeof(double)); */
+	/*       ds.potential=(double*)malloc(n_vals*sizeof(double)); */
+	/*       ds.pos=(vec*)malloc(n_vals*sizeof(vec)); */
+	/*       if ((ds.pos == NULL) ||  */
+	/* 	  (ds.tcol == NULL) || */
+	/* 	  (ds.emag == NULL) || */
+	/* 	  (ds.potential == NULL) || */
+	/* 	  (ds.sigma_resp == NULL)) { */
+	/* 	fprintf(stderr,"can't allocate. exiting..\n"); */
+	/* 	exit(1); */
+	/*       } */
+
+	/*       cpvec(&pinch,&pscpy); */
+	/*       drift(&pinch,&ds,&ccd_rp.ccdpars,msi, */
+	/* 	    ccd_rp.ccdpars.e,n_vals,FORWARD,&my_iter); */
+	/*       // printout drift trace */
+	/*       { */
+	/* 	int i; */
+	/* 	for (i=0;i<=my_iter;i++) { */
+	/* 	  fprintf(fgp,"%d %d %d %d %g %g %g %g %g %g %g %g %g\n", */
+	/* 		  xf,yf,crn.crns[crn_ix].way,i, */
+	/* 		  ds.pos[i].z*1e4,ds.pos[i].x*1e4,ds.pos[i].y*1e4, */
+	/* 		  (ds.pos[i].x-pscpy.x)*1e4, */
+	/* 		  (ds.pos[i].y-pscpy.y)*1e4, */
+	/* 		  ds.emag[i],ds.potential[i],ds.tcol[i], */
+	/* 		  ds.sigma_resp[i]); */
+	/* 	} */
+	/*       } */
+	/*       // free allocated driftstruct */
+	/*       free(ds.sigma_resp); */
+	/*       free(ds.tcol); */
+	/*       free(ds.emag); */
+	/*       free(ds.potential); */
+	/*       free(ds.pos); */
+	/*     } */
+	/*   } */
+	/* } */
+	/* fclose(fgp); */
+      }
+
       if (bnd.nbnds>0) {
 	// compute the boundary locus
 	int aim_x1,aim_y1;
@@ -1335,7 +1622,7 @@ void drift (vec *ps,driftstruct *ds,
     cpvec(ps,&(ds->pos[*iter]));
     (*iter)++;
   } while ((ps->z > 5e-5) && (ps->z < pars->t_si) && 
-	   (*iter<n_vals-1) && (emag>200));
+	   (*iter<2*n_vals-1) && (emag>200)); // here
 
   {
     int i=*iter;
@@ -1440,7 +1727,7 @@ int multipole_stack_pinch(vec *p1,vec *p2,vec *pinch,
       vec_diff(p[0],p[1],&tmpo);
       span=modulus(&tmpo);
     }
-  } while (span>0.001e-3/10);
+  } while (span>0.001e-5); // cm
   cpvec(p[2],pinch);
  abandon:
   return(retval);
@@ -1542,4 +1829,235 @@ void drift2pix (vec *ps,bi_ccd_pars *pars,multipole_stack *msi,
   free(ds.emag);
   free(ds.potential);
   free(ds.pos);
+}
+
+void locate_pix_edge (crn_subset *crn,ccd_runpars *ccd_rpp,multipole_stack *msi) {
+  int aim_x1,aim_y1;
+  int aim_x2,aim_y2;
+  float startx,starty;
+  int aim_ix;
+  int old_style=0;
+  int n_vals=ccd_rpp->ccdpars.n_sigma;
+  vec mean_crn[2];
+  
+  // locate the corner before computing anything 
+  // (this should be moved into the loop below)
+
+  fprintf(stderr,"for pixel (x,y)=(%d,%d) in %d steps:\n",
+	  crn->pixcoord[0],crn->pixcoord[1],crn->n_elem);
+
+  aim_x1=crn->pixcoord[0];
+  aim_y1=crn->pixcoord[1];
+  aim_x2=(crn->way==BND_ROW)?aim_x1+1:aim_x1;
+  aim_y2=(crn->way==BND_COLUMN)?aim_y1+1:aim_y1;
+  // corner 1: aim_x1,aim_y1 is the coordinate that divides
+  // charge channels (x,y)=(aim_x1-1,aim_y1-1) from 
+  // (aim_x1-1,aim_y1), (aim_x1,aim_y1-1) and (aim_x1,aim_y1) etc.
+  int vertex;
+  int aim_x[]={aim_x1,aim_x2};
+  int aim_y[]={aim_y1,aim_y2};
+
+  for (vertex=0;vertex<2;vertex++) {
+
+    mean_crn[vertex].x=mean_crn[vertex].y=mean_crn[vertex].z=0;
+
+    vec psstart={(aim_x[vertex]-1)*0.01/10.0,
+		 (aim_y[vertex]-1)*0.01/10.0,
+		 ccd_rpp->ccdpars.z[0]};
+
+    vec ps[5];
+    int x[5],y[5];
+
+    cpvec(&psstart,&ps[0]);    cpvec(&psstart,&ps[1]);    cpvec(&psstart,&ps[2]);
+    cpvec(&psstart,&ps[3]);    cpvec(&psstart,&ps[4]);
+
+    // find points at the back side that get mapped to each pixel bounding the corner
+    target_pix(aim_x[vertex]-1,aim_y[vertex]-1,&ps[0],
+	       &ccd_rpp->ccdpars,msi,ccd_rpp->ccdpars.e,n_vals,BND_EITHER);
+    target_pix(aim_x[vertex],aim_y[vertex]-1,&ps[1],
+	       &ccd_rpp->ccdpars,msi,ccd_rpp->ccdpars.e,n_vals,BND_EITHER);
+    target_pix(aim_x[vertex]-1,aim_y[vertex],&ps[2],
+	       &ccd_rpp->ccdpars,msi,ccd_rpp->ccdpars.e,n_vals,BND_EITHER);
+    target_pix(aim_x[vertex],aim_y[vertex],&ps[3],
+	       &ccd_rpp->ccdpars,msi,ccd_rpp->ccdpars.e,n_vals,BND_EITHER);
+
+    // now fold forward and identify the pixels into which each starting
+    // position drifts toward.
+
+    // verify that each backside position ps[0..4] indeed maps to different pixels
+
+    drift2pix(&ps[0],&ccd_rpp->ccdpars,msi,ccd_rpp->ccdpars.e,n_vals,&x[0],&y[0]);	
+    drift2pix(&ps[1],&ccd_rpp->ccdpars,msi,ccd_rpp->ccdpars.e,n_vals,&x[1],&y[1]);	
+    drift2pix(&ps[2],&ccd_rpp->ccdpars,msi,ccd_rpp->ccdpars.e,n_vals,&x[2],&y[2]);	
+    drift2pix(&ps[3],&ccd_rpp->ccdpars,msi,ccd_rpp->ccdpars.e,n_vals,&x[3],&y[3]);
+	
+    fprintf(stderr,"0: (xpix,ypix)=(%d,%d)\n",x[0],y[0]);
+    fprintf(stderr,"1: (xpix,ypix)=(%d,%d)\n",x[1],y[1]);
+    fprintf(stderr,"2: (xpix,ypix)=(%d,%d)\n",x[2],y[2]);
+    fprintf(stderr,"3: (xpix,ypix)=(%d,%d)\n",x[3],y[3]);
+
+    double min_rms=1e-3;
+    double theta,sM,sm,dM,dm;
+    theta=0;
+    sM = sm = min_rms/sqrt(2.0);
+    int idumi=-1;
+    do {
+      cpvec(&ps[0],&ps[4]);
+
+      ps[4].x=(ps[0].x+ps[1].x+ps[2].x+ps[3].x)/4.0;
+      ps[4].y=(ps[0].y+ps[1].y+ps[2].y+ps[3].y)/4.0;
+
+      dM = sM/sqrt(1.5)*gasdev(&idumi);
+      dm = sm/sqrt(1.5)*gasdev(&idumi);
+      if (1) {
+	ps[4].x += (dM*cos(theta)-dm*sin(theta));
+	ps[4].y += (dM*sin(theta)+dm*cos(theta));
+      } else {
+	ps[4].x += min_rms/sqrt(1.5)*gasdev(&idumi);
+	ps[4].y += min_rms/sqrt(1.5)*gasdev(&idumi);
+      }
+
+      drift2pix(&ps[4],&ccd_rpp->ccdpars,msi,ccd_rpp->ccdpars.e,n_vals,&x[4],&y[4]);
+      // look at all combinations of 4 positions from the 5 computed
+      // to report RMS of the starting position if the 4 starting points
+      // occupy each of the 4 pixels we need to bracket.
+      {
+	int skip,pt,comb_flags,min_skip;
+	double sx,sxx,sy,syy,sxy,rms;
+	min_rms=1e6;
+
+	for (skip=0;skip<5;skip++) {
+	  comb_flags= 0x0000;
+	  sxy = sx = sxx = sy = syy = 0.0;
+	  for (pt=0;pt<5;pt++) {
+	    if (pt != skip) {
+	      comb_flags |= (0x0001<<((y[pt]-aim_y[vertex]+1)*2+(x[pt]-aim_x[vertex]+1)));
+	      sx += ps[pt].x;		        sy += ps[pt].y;
+	      sxx += (ps[pt].x*ps[pt].x);	syy += (ps[pt].y*ps[pt].y);
+	      sxy += (ps[pt].x*ps[pt].y);
+	    } else {
+	      // do nothing, this pixel is being skipped
+	    }
+	  }
+	  if (comb_flags == 0x000f) {
+	    sx /= 4;	      sy /= 4;	      sxx /= 4;	      syy /= 4;
+	    sxy /= 4;
+	    sxx -= pow(sx,2);	              syy -= pow(sy,2);
+	    sxy -= sx*sy;
+	    theta=0.5*atan2(2*sxy,sxx-syy);
+	    // semimajor & semiminor axes:
+	    sM = sqrt(0.5*(sxx+syy + 0.3*sqrt(pow(sxx-syy,2)+pow(2*sxy,2))));
+	    sm = sqrt(0.5*(sxx+syy - 0.3*sqrt(pow(sxx-syy,2)+pow(2*sxy,2))));
+
+	    rms = sqrt(pow(sM,2)+pow(sm,2));
+	    if (rms<min_rms) {
+	      min_rms=rms;
+	      min_skip=skip;
+	    }
+	  }
+	}
+	//	      fprintf(stderr,"min_rms=%g min_skip=%d\n",min_rms,min_skip);
+	// repopulate ps[0-3] by skipping over min_skip
+	int r_ix=0;
+	for (pt=0;pt<5;pt++) {
+	  if (pt != min_skip) {
+	    // swap ps[pt] & ps[r_ix] and swap {x,y}[pt] & {x,y}[r_ix]
+	    // unless want to rerun pixel identification.
+	    //		fprintf(stderr,"swap %d & %d\n",pt,r_ix);
+	    vec tmp_vec;
+	    cpvec(&ps[pt],&tmp_vec);	      
+	    cpvec(&ps[r_ix],&ps[pt]);
+	    cpvec(&tmp_vec,&ps[r_ix]);
+	    // do the same for x coords
+	    int tmp_addr;
+	    tmp_addr=x[pt];
+	    x[pt]=x[r_ix];
+	    x[r_ix]=tmp_addr;
+	    // and for y coords
+	    tmp_addr=y[pt];
+	    y[pt]=y[r_ix];
+	    y[r_ix]=tmp_addr;
+	    r_ix++;
+	  }
+	}
+	// generate a new starting point and store in ps[4]. repeat.
+	cpvec(&ps[0],&mean_crn[vertex]);
+	mean_crn[vertex].x=(ps[0].x+ps[1].x+ps[2].x+ps[3].x)/4.0;
+	mean_crn[vertex].y=(ps[0].y+ps[1].y+ps[2].y+ps[3].y)/4.0;
+      }
+      if (1) {
+	fprintf(stderr,"\rmin_rms=%g sM=%g sm=%g theta=%f\t",min_rms,sM,sm,theta);
+      } else {
+	fprintf(stderr,"\rmin_rms=%g\t",min_rms);
+      }
+    } while (min_rms>/* 3e-7 */ 1e-6); // 1e-7 cm = 1nm
+
+    fprintf(stderr,"%s\n",show_vector("mean_corner",&mean_crn[vertex]));
+    cpvec(&mean_crn[vertex],&crn->corner[vertex]);
+  }
+
+  fprintf(stderr,"from (x,y)=(%d,%d) to (%d,%d)\n",
+	  aim_x[0],aim_y[0],
+	  aim_x[1],aim_y[1]);
+  // now trace. set up a bnd type calculation.
+  {
+    int pt_ix;
+    int betw_pix[]={(crn->way==BND_ROW)?aim_y[0]-1:aim_x[0]-1,
+		    (crn->way==BND_ROW)?aim_y[0]  :aim_x[0]};
+    
+    // fill in the corner values at the head & tail of the array
+    crn->dist_along_edge[0]=
+      (crn->way==BND_ROW)?mean_crn[0].x:mean_crn[0].y;
+    crn->dist_along_edge[crn->n_elem-1]=
+      (crn->way==BND_ROW)?mean_crn[1].x:mean_crn[1].y;
+    crn->edge_distortion[0]=
+      (crn->way==BND_ROW)?mean_crn[0].y:mean_crn[0].x;
+    crn->edge_distortion[crn->n_elem-1]=
+      (crn->way==BND_ROW)?mean_crn[1].y:mean_crn[1].x;
+
+    // then fill in the rest
+    for (pt_ix=1;pt_ix<crn->n_elem-1;pt_ix++) {
+      crn->dist_along_edge[pt_ix]=((crn->way==BND_ROW)?mean_crn[0].x:mean_crn[0].y)+
+	(pt_ix/((float)crn->n_elem-1)*
+	 ((crn->way==BND_ROW)?(mean_crn[1].x-mean_crn[0].x):
+	  (mean_crn[1].y-mean_crn[0].y)));
+      vec startpos,sp[2],pinchpos;
+      int sx[2],sy[2];
+      
+      startpos.z=ccd_rpp->ccdpars.z[0];
+
+      if (pt_ix==0) {
+	startpos.x=
+	  (crn->way==BND_ROW)?crn->dist_along_edge[pt_ix]:aim_x[0]*0.01/10.0;
+	startpos.y=
+	  (crn->way==BND_ROW)?aim_y[0]*0.01/10.0:crn->dist_along_edge[pt_ix];
+      } else {
+	// take advantage of previous calculation results, careful of any offset
+	// applied to dist_along_edge[]
+	startpos.x=((crn->way==BND_ROW)?crn->dist_along_edge[pt_ix]:
+		    crn->edge_distortion[pt_ix-1]);
+	startpos.y=((crn->way==BND_ROW)?crn->edge_distortion[pt_ix-1]:
+		    crn->dist_along_edge[pt_ix]);
+      }
+
+      cpvec(&startpos,&sp[0]);      cpvec(&startpos,&sp[1]);
+      sx[0]=(crn->way==BND_ROW)?0:betw_pix[0];
+      sx[1]=(crn->way==BND_ROW)?0:betw_pix[1];
+      sy[0]=(crn->way==BND_ROW)?betw_pix[0]:0;
+      sy[1]=(crn->way==BND_ROW)?betw_pix[1]:0;;
+
+      target_pix(sx[0],sy[0],&sp[0],&ccd_rpp->ccdpars,msi,ccd_rpp->ccdpars.e,
+		 n_vals,crn->way);
+      target_pix(sx[1],sy[1],&sp[1],&ccd_rpp->ccdpars,msi,ccd_rpp->ccdpars.e,
+		 n_vals,crn->way);
+      if (multipole_stack_pinch(&sp[0],&sp[1],&pinchpos,crn->way,
+				&ccd_rpp->ccdpars,ccd_rpp->ccdpars.e,msi) == -1) {
+	// didn't converge
+      } else {
+	// found it.
+	crn->edge_distortion[pt_ix]=(crn->way==BND_ROW)?pinchpos.y:pinchpos.x;
+	fprintf(stderr,"NOM: (distance,distortion)=(%g,%g)\n",crn->dist_along_edge[pt_ix],crn->edge_distortion[pt_ix]);
+      }
+    }
+  }
 }
