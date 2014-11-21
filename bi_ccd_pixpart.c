@@ -35,6 +35,8 @@ void dipole_3d (vec *x_vec,vec *p_vec,vec *x0_vec,vec *dummy,vec *field);
 void dipole_2d (vec *x_vec,vec *p_vec,vec *x0_vec,vec *sym_axis,vec *field);
 void trunc_dipole_2d (vec *x_vec,vec *p_vec,vec *x0_vec,
 		      vec *sym_axis,vec *field);
+void dipolegrid_2d_orig (vec *x_vec,vec *p_vec,vec *x0_vec,
+			 vec *sym_axis,vec *field);
 void dipolegrid_2d (vec *x_vec,vec *p_vec,vec *x0_vec,
 		    vec *sym_axis,vec *field);
 
@@ -172,7 +174,7 @@ char *usage_str=
 
 
 int main(int argc,char *argv[]) {
-
+  
   int nim=6;
 
   wid_mgmt wid;
@@ -606,15 +608,12 @@ int main(int argc,char *argv[]) {
 
   {
     int dpa_ix,dpg_ix,dls_ix,tdp_ix;
-    truncated_dipole_struct *tdp;
-    dipole_array_struct *dps;
-    dipole_list_struct  *dls;
     int im;
     
     for (im=0;im<=nim;im++) {
       // dipole grids
       for (dpg_ix=0;dpg_ix<dpgm.ndpg;dpg_ix++) {
-	dps=&dpgm.dpgs[dpg_ix];
+	dipole_array_struct *dps=&dpgm.dpgs[dpg_ix];
 	float deg=atan2(1,1)/45.0;
 	float cs=cos(dps->phi*deg);
 	float sn=sin(dps->phi*deg);
@@ -671,7 +670,7 @@ int main(int argc,char *argv[]) {
       // truncated dipoles
 
       for (tdp_ix=0;tdp_ix<tdpm.ntdp;tdp_ix++) {
-	tdp=&tdpm.tdps[tdp_ix];
+	truncated_dipole_struct *tdp=&tdpm.tdps[tdp_ix];
 
 	float deg=atan2(1,1)/45.0;
 	float cs=cos(tdp->phi*deg);
@@ -680,10 +679,10 @@ int main(int argc,char *argv[]) {
 	  cs=0;
 	  sn=1;
 	}
-	// establish axis of symmetry
+	// establish axis of symmetry to be rotated by phi later
 	vec trunc_axis={0,1,0};
-	vec tdp_pos={tdp->startpix_x,tdp->startpix_y,0};
-	scalevec(&tdp_pos,0.01/10.0); // position of the truncation
+	vec tdp_pos={tdp->startpix_x,tdp->startpix_y,0}; // units are pixels
+	scalevec(&tdp_pos,0.01/10.0); // position of the truncation, now in cm
 
 	{
 	  float xc;
@@ -692,14 +691,16 @@ int main(int argc,char *argv[]) {
 
 	  vp=&trunc_axis;
 	  xc=vp->x;             yc=vp->y;
-	  vp->x=+xc*cs-yc*sn;	vp->y=+xc*sn+yc*cs;
+	  // the following choice is so that phi=0 corresponds to channel stops (y) and phi=90 corresponds to x.
+	  vp->x=+xc*cs+yc*sn;	vp->y=-xc*sn+yc*cs;
 	}
 
 	vec pos;
 	vec z_unit={0,0,1};
-	vec dipole_unit={cs*sin(tdp->theta*deg),
-			 sn*sin(tdp->theta*deg),
-			 cos(tdp->theta*deg)};
+	// the following choice is consistent with definition above.
+	vec dipole_unit={+cs*sin(tdp->theta*deg),
+			 -sn*sin(tdp->theta*deg),
+			 +cos(tdp->theta*deg)};
 	vec z_image;
 	int each;
 
@@ -715,7 +716,7 @@ int main(int argc,char *argv[]) {
 	  vec dipole2d;
 	  // cpvec(&z_unit,&dipole2d);
 	  cpvec(&dipole_unit,&dipole2d);
-	  scalevec(&dipole2d,dps->dipole_moment*xi_moment);
+	  scalevec(&dipole2d,tdp->dipole_moment*xi_moment);
 	  multipole_stack_append(&msi,trunc_dipole_2d,&dipole2d,&pos,&trunc_axis);
 	}
       }
@@ -723,12 +724,12 @@ int main(int argc,char *argv[]) {
       // dipole arrays
 
       for (dpa_ix=0;dpa_ix<dpam.ndpa;dpa_ix++) {
-	dps=&dpam.dpas[dpa_ix];
+	dipole_array_struct *dpa=&dpam.dpas[dpa_ix];
 	int ix;
 	float deg=atan2(1,1)/45.0;
-	float cs=cos(dps->phi*deg);
-	float sn=sin(dps->phi*deg);
-	if (dps->phi == 90) {
+	float cs=cos(dpa->phi*deg);
+	float sn=sin(dpa->phi*deg);
+	if (dpa->phi == 90) {
 	  cs=0;
 	  sn=1;
 	}
@@ -737,7 +738,7 @@ int main(int argc,char *argv[]) {
 	vec step={0.01/10.0,0,0};
 	vec startpos;
 	cpvec(&step,&startpos);
-	scalevec(&startpos,(float)dps->startpix);
+	scalevec(&startpos,(float)dpa->startpix);
 
 	{
 	  float xc;
@@ -758,9 +759,9 @@ int main(int argc,char *argv[]) {
 	}
 	vec pos;
 	vec z_unit={0,0,1};
-	vec dipole_unit={cs*sin(dps->theta*deg),
-			 sn*sin(dps->theta*deg),
-			 cos(dps->theta*deg)};
+	vec dipole_unit={cs*sin(dpa->theta*deg),
+			 sn*sin(dpa->theta*deg),
+			 cos(dpa->theta*deg)};
 	vec z_image;
 	int each;
 
@@ -778,16 +779,16 @@ int main(int argc,char *argv[]) {
 	    vec dipole2d;
 	    //	    cpvec(&z_unit,&dipole2d);
 	    cpvec(&dipole_unit,&dipole2d);
-	    scalevec(&dipole2d,dps->dipole_moment*xi_moment);
+	    scalevec(&dipole2d,dpa->dipole_moment*xi_moment);
 	    multipole_stack_append(&msi,dipole_2d,&dipole2d,&pos,&sym_axis);
 	    vec_add(&pos,&step,&pos);
-	  } while (ix++ < dps->npix);
+	  } while (ix++ < dpa->npix);
 	}
       }
 
       // and do the 3d dipoles
       for (dls_ix=0;dls_ix<dlm.ndls;dls_ix++) {
-	dls=&dlm.dls[dls_ix];
+	dipole_list_struct *dls=&dlm.dls[dls_ix];
 	vec pos;
 	vec half_pixel_offset={0.5,0.5,0};
 	//	vec half_pixel_offset={0.5*0.01/10.0,0.5*0.01/10.0,0};
@@ -812,7 +813,6 @@ int main(int argc,char *argv[]) {
 	  multipole_stack_append(&msi,dipole_3d,&dipole3d,&pos,NULL);
 	}
       }
-
     }
 
     //     multipole_stack_inspect(msi);
@@ -820,23 +820,20 @@ int main(int argc,char *argv[]) {
     {
       int i;
       int n_vals=ccd_rp.ccdpars.n_sigma;
-      int nresp=1;
-      driftstruct ds[nresp];
+      driftstruct ds;
       
-      for (i=0;i<nresp;i++) {
-	ds[i].sigma_resp=(double*)malloc(n_vals*sizeof(double));
-	ds[i].tcol=(double*)malloc(n_vals*sizeof(double));
-	ds[i].emag=(double*)malloc(n_vals*sizeof(double));
-	ds[i].potential=(double*)malloc(n_vals*sizeof(double));
-	ds[i].pos=(vec*)malloc(n_vals*sizeof(vec));
-	if ((ds[i].pos == NULL) || 
-	    (ds[i].tcol == NULL) ||
-	    (ds[i].emag == NULL) ||
-	    (ds[i].potential == NULL) ||
-	    (ds[i].sigma_resp == NULL)) {
-	  fprintf(stderr,"can't allocate. exiting..\n");
-	  exit(1);
-	}
+      ds.sigma_resp=(double*)malloc(n_vals*sizeof(double));
+      ds.tcol=(double*)malloc(n_vals*sizeof(double));
+      ds.emag=(double*)malloc(n_vals*sizeof(double));
+      ds.potential=(double*)malloc(n_vals*sizeof(double));
+      ds.pos=(vec*)malloc(n_vals*sizeof(vec));
+      if ((ds.pos == NULL) || 
+	  (ds.tcol == NULL) ||
+	  (ds.emag == NULL) ||
+	  (ds.potential == NULL) ||
+	  (ds.sigma_resp == NULL)) {
+	fprintf(stderr,"can't allocate. exiting..\n");
+	exit(1);
       }
 
       if (slm.nss > 0) {
@@ -882,16 +879,16 @@ int main(int argc,char *argv[]) {
 	    ps.z=ccd_rp.ccdpars.z[0];
 	    cpvec(&ps,&pscpy);
 
-	    drift (&ps,&ds[0],
+	    drift (&ps,&ds,
 		   &ccd_rp.ccdpars,msi,ccd_rp.ccdpars.e,
 		   n_vals,FORWARD,&iter);
 	    // and report
 	    for (i=0;i<=iter;i++) {
 	      fprintf(fp,"%d %g %g %g %g %g %g %g %g %g\n",sl_ix,
-		      ds[j].pos[i].z*1e4,ds[j].pos[i].x*1e4,ds[j].pos[i].y*1e4,
-		      (ds[j].pos[i].x-pscpy.x)*1e4,(ds[j].pos[i].y-pscpy.y)*1e4,
-		      ds[j].emag[i],ds[j].potential[i],ds[j].tcol[i],
-		      ds[j].sigma_resp[i]);
+		      ds.pos[i].z*1e4,ds.pos[i].x*1e4,ds.pos[i].y*1e4,
+		      (ds.pos[i].x-pscpy.x)*1e4,(ds.pos[i].y-pscpy.y)*1e4,
+		      ds.emag[i],ds.potential[i],ds.tcol[i],
+		      ds.sigma_resp[i]);
 	    }
 	  }
 	}
@@ -1047,6 +1044,8 @@ int main(int argc,char *argv[]) {
 	    }
 	  }
 	}
+	fclose(fgp);
+	fclose(ggp);
 	exit(0);
 	/* FILE *fgp=fopen("sora.tnt","w"); */
 
@@ -1184,7 +1183,7 @@ int main(int argc,char *argv[]) {
 	float startx,starty;
 	int aim_ix;
 	int bnd_ix;
-	int old_style=0;
+	int old_style=1;
 
 	FILE *ffp=fopen("sore.tnt","w");
 
@@ -1310,6 +1309,7 @@ int main(int argc,char *argv[]) {
 	}
 	fclose(ffp);
       }
+
       if (0) {
 	vec ps={0,0,0};
 
@@ -1319,7 +1319,7 @@ int main(int argc,char *argv[]) {
 
 	int iter=0;
 
-	drift (&ps,&ds[0],
+	drift (&ps,&ds,
 	       &ccd_rp.ccdpars,msi,ccd_rp.ccdpars.e,
 	       n_vals,FORWARD,&iter);
 	{
@@ -1329,23 +1329,25 @@ int main(int argc,char *argv[]) {
 
 	  for (i=0;i<=iter;i++) {
 	    fprintf(fp,"%d %g %g %g %g %g %g %g %g\n",i,
-		    ds[j].pos[i].z,ds[j].pos[i].x,ds[j].pos[i].y,
-		    ps.x,ds[j].emag[i],ds[j].potential[i],ds[j].tcol[i],
-		    ds[j].sigma_resp[i]);
+		    ds.pos[i].z,ds.pos[i].x,ds.pos[i].y,
+		    ps.x,ds.emag[i],ds.potential[i],ds.tcol[i],
+		    ds.sigma_resp[i]);
 	  }
 	}
       }
       //    cleanup:
-      for (i=0;i<nresp;i++) {
-	free(ds[i].sigma_resp);
-	free(ds[i].tcol);
-	free(ds[i].emag);
-	free(ds[i].potential);
-	free(ds[i].pos);
+      if (0) { 
+	// for some reason freeing up allocated arrays was triggering
+	// a core dump (!?) skip for now, end of program.
+	free(ds.sigma_resp);
+	free(ds.tcol);
+	free(ds.emag);
+	free(ds.potential);
+	free(ds.pos);
       }
     }
   }
-  return(0);
+  exit(0);
 }
 
 void dipole_3d (vec *x_vec,vec *p_vec,vec *x0_vec,vec *dummy,vec *field) {
@@ -1367,6 +1369,82 @@ void dipole_3d (vec *x_vec,vec *p_vec,vec *x0_vec,vec *dummy,vec *field) {
 }
 
 void dipolegrid_2d (vec *x_vec,vec *p_vec,vec 
+		    *x0_vec,vec *sym_axis,vec *field) {
+  vec p_uvec;
+  vec sym_uvec;
+  vec lat_vec;
+  vec r_vec;
+
+  // this is for an infinite grid of dipoles periodic in the direction 
+  // perpendicular to both sym_axis and also to z. p_vec may be rotated in 
+  // the plane that is perpendicular to sym_axis. this has to be handled above.
+
+  // sanity check: sym_axis should be orthogonal to p_vec
+  cpvec(p_vec,&p_uvec);  
+  unitvec(&p_uvec);
+  cpvec(sym_axis,&sym_uvec); 
+  unitvec(&sym_uvec);
+
+  double dp = dot_prod(&sym_uvec,&p_uvec);
+  if (dp*dp>1e-8) {
+    fprintf(stderr,"dot product between symmetry axis and dipole moment is not zero!\nexiting..\n");
+    exit(1);
+  }
+
+  // establish the lateral coordinate by lateral = sym_axis x p_uvec and then remove any z component.
+  vec lat_uvec;
+  cross_prod(&sym_uvec,&p_uvec,&lat_uvec);
+  lat_uvec.z=0;
+  unitvec(&lat_uvec);
+  // decompose p_vec into lat & z components
+  vec z_uvec={0,0,1};
+  double p_lat,p_z;
+  p_lat=dot_prod(&lat_uvec,p_vec);
+  p_z  =dot_prod(&z_uvec,p_vec);
+
+  vec vA,vB,tmp;
+  cpvec(&lat_uvec,&vA);
+  scalevec(&vA,p_lat);
+  cpvec(&z_uvec,&tmp);
+  scalevec(&tmp,-p_z);
+  vec_add(&vA,&tmp,&vA);
+
+  cpvec(&z_uvec,&vB);
+  scalevec(&vB,p_lat);
+  cpvec(&lat_uvec,&tmp);
+  scalevec(&tmp,p_z);
+  vec_add(&vB,&tmp,&vB);
+
+  if (x0_vec==NULL) {
+    cpvec(x_vec,&r_vec);
+  } else {
+    vec_diff(x_vec,x0_vec,&r_vec);
+  }
+  
+  double rho_lat,rho_z;
+  rho_lat=dot_prod(&r_vec,&lat_uvec);
+  rho_z  =dot_prod(&r_vec,&z_uvec);
+
+  double a,b;
+  double pixel=0.01/10.0;
+  a = 2*M_PI*rho_lat/pixel;
+  b = 2*M_PI*rho_z/pixel;
+
+  double coshb=cosh(b);
+  double cosa=cos(a);
+  double A,B;
+  
+  A=(pow(coshb,-2)-cosa/coshb)/pow(1-cosa/coshb,2);
+  B=sin(a)*tanh(b)/coshb/pow(1-cosa/coshb,2);
+
+  scalevec(&vA,A);
+  scalevec(&vB,B);
+  vec_add(&vA,&vB,field);
+  scalevec(field,M_PI/(e_0*e_si*pow(pixel,2)));
+  return;
+}
+
+void dipolegrid_2d_orig (vec *x_vec,vec *p_vec,vec 
 		    *x0_vec,vec *sym_axis,vec *field) {
   vec p_uvec;
   vec lat_vec;
@@ -1426,7 +1504,8 @@ void dipolegrid_2d (vec *x_vec,vec *p_vec,vec
   return;
 }
 
-void dipole_2d (vec *x_vec,vec *p_vec,vec *x0_vec,vec *sym_axis,vec *field) {
+void dipole_2d (vec *x_vec,vec *p_vec,vec *x0_vec,
+		vec *sym_axis,vec *field) {
   vec tmp_n_vec;
   vec tmp_r_vec;
   double r;
@@ -1459,9 +1538,11 @@ void dipole_2d (vec *x_vec,vec *p_vec,vec *x0_vec,vec *sym_axis,vec *field) {
 void trunc_dipole_2d (vec *x_vec,vec *p_vec,vec *x0_vec,
 		      vec *trunc_axis,vec *field) {
   // trunc_axis is the vector that points away from the truncation point
-  // toward infinity, according to the specified phi value.
+  // toward infinity, according to the specified phi value. The opposite direction contains 
+  // the distributed line dipole. This truncation axis is used similarly to the
+  // symmetry axis for the non-truncated dipole.
   // if phi=0, trunc_axis is parallel to \hat{y}
-  // if phi=90, trunc_axis is antiparallel to \hat{x}
+  // if phi=90, trunc_axis is parallel to \hat{x}
   //
   // derived expression requires (2d) rho, (3d) r and various
   // dot products
@@ -1469,70 +1550,66 @@ void trunc_dipole_2d (vec *x_vec,vec *p_vec,vec *x0_vec,
   vec r_uvec;
   vec rho_vec;
   vec rho_uvec;
-  vec trunc;
-  vec z_uvec;
-
-  double cos_theta0,p_dot_r;
-  double r,rho;
-
+  vec trunc_uvec;
+  vec part1,part2;
+  double cos_theta0;
+  double sin_theta0;
+  double rho_dot_xi;
+  double rho;
+  
+  // prepare r_vec
   if (x0_vec==NULL) {
     cpvec(x_vec,&r_vec);
   } else {
     vec_diff(x_vec,x0_vec,&r_vec);
   }
 
-  r=sqrt(dot_prod(&r_vec,&r_vec)); // distance between sampling & trunc points
+  // prepare r_uvec
   cpvec(&r_vec,&r_uvec);
   unitvec(&r_uvec);
 
-  if (trunc_axis == NULL) {
-    vec tmp_vec={0,1,0};
-    cpvec(&tmp_vec,&trunc);
-  } else {
-    // make use of the axis of symmetry
-    cpvec(trunc_axis,&trunc);
-  }
+  // prepare trunc_uvec
+  cpvec(trunc_axis,&trunc_uvec);
+  unitvec(&trunc_uvec);
 
-  cpvec(&trunc,&z_uvec);
-  scalevec(&z_uvec,-1);
-  unitvec(&z_uvec); // so that &trunc is the analog of k vector (in calcs)
+  // prepare cos_theta0 & sin_theta0
+  cos_theta0=dot_prod(&r_uvec,&trunc_uvec);
+  sin_theta0=sin(1-pow(cos_theta0,2));
+  
+  // prepare rho_vec
+  cpvec(trunc_axis,&rho_vec);
+  scalevec(&rho_vec,-1*dot_prod(&r_vec,&trunc_uvec));
+  vec_add(&r_vec,&rho_vec,&rho_vec);
+  rho=modulus(&rho_vec);
 
-  // compute cos_theta0 & p_dot_r
-  cos_theta0 = dot_prod(&z_uvec,&r_uvec);
-  p_dot_r = dot_prod(p_vec,&r_uvec);
-
-  // generate rho and rho_uvec:
-  cpvec(&z_uvec,&rho_vec);
-  scalevec(&rho_vec,r*cos_theta0);
-  vec_diff(&r_vec,&rho_vec,&rho_vec);
+  // prepare rho_uvec
   cpvec(&rho_vec,&rho_uvec);
-  rho = sqrt(dot_prod(&rho_vec,&rho_vec));
   unitvec(&rho_uvec);
+  
+  // prepare rho_uvec_dot_xi
+  rho_dot_xi = dot_prod(&rho_uvec,p_vec);
 
-  // now have required unit vectors rho_uvec, r_uvec, z_uvec
-
-  // problem in the generation of some of the quantities generated above for approx. z=0. not sure where
-
-  vec part1,part2;
-
+  // prepare part1
   cpvec(&rho_uvec,&part1);
-  scalevec(&part1,2*dot_prod(&rho_uvec,p_vec));
-  vec_diff(&part1,p_vec,&part1);
-  scalevec(&part1,0.5*(1-cos_theta0));
+  scalevec(&part1,rho_dot_xi*(2-cos_theta0*(3-cos_theta0*cos_theta0)));
 
-  cpvec(&rho_vec,&part2);
-  scalevec(&part2,p_dot_r*cos_theta0/r);
+  // prepare part2
+  cpvec(trunc_axis,&part2);
+  scalevec(&part2,rho_dot_xi*pow(sin_theta0,3));
+
+  // collect parts 1 & 2 into part1
   vec_add(&part1,&part2,&part1);
 
-  scalevec(&part1,1.0/(2*M_PI*e_0*e_si*pow(rho,2)));
+  // prepare part3 but store in part2
+  cpvec(p_vec,&part2);
+  scalevec(&part2,cos_theta0-1.0);
 
-  // 2nd part
-  cpvec(&z_uvec,&part2);
-  scalevec(&part2,-p_dot_r/(4*M_PI*e_0*e_si*pow(r,2)));
-
-  // sum
-  vec_add(&part1,&part2,field);
-  //  cpvec(&part1,field);
+  // collect part3 in to part1
+  vec_add(&part1,&part2,&part1);
+  
+  // perform scaling then shipout
+  scalevec(&part1,1.0/(4*M_PI*e_0*e_si*pow(rho,2)));
+  cpvec(&part1,field); 
   return;
 }
 
@@ -1801,34 +1878,55 @@ void target_pix(int x,int y,vec *ps,bi_ccd_pars *pars,multipole_stack *msi,
 void drift2pix (vec *ps,bi_ccd_pars *pars,multipole_stack *msi,
 		double *e,int n_vals,int *xpix,int *ypix) {
   int iter=0;
-  driftstruct ds;
+  static driftstruct ds;
   float offset=-0.005/10.0;
   offset=0;
   vec pscpy;
+  static int inited=0;
+
 
   cpvec(ps,&pscpy);
 
-  ds.sigma_resp=(double*)malloc(n_vals*sizeof(double));
-  ds.tcol=(double*)malloc(n_vals*sizeof(double));
-  ds.emag=(double*)malloc(n_vals*sizeof(double));
-  ds.potential=(double*)malloc(n_vals*sizeof(double));
-  ds.pos=(vec*)malloc(n_vals*sizeof(vec));
-  if ((ds.pos == NULL) || (ds.tcol == NULL) || (ds.emag == NULL) ||
-      (ds.potential == NULL) || (ds.sigma_resp == NULL)) {
-    fprintf(stderr,"can't allocate. exiting..\n");
-    exit(1);
+  if (0) {
+    ds.sigma_resp=(double*)malloc(n_vals*sizeof(double));
+    ds.tcol=(double*)malloc(n_vals*sizeof(double));
+    ds.emag=(double*)malloc(n_vals*sizeof(double));
+    ds.potential=(double*)malloc(n_vals*sizeof(double));
+    ds.pos=(vec*)malloc(n_vals*sizeof(vec));
+    if ((ds.pos == NULL) || (ds.tcol == NULL) || (ds.emag == NULL) ||
+	(ds.potential == NULL) || (ds.sigma_resp == NULL)) {
+      fprintf(stderr,"can't allocate. exiting..\n");
+      exit(1);
+    }
+  } else {
+    if (!inited) {
+      ds.sigma_resp=(double*)malloc(n_vals*sizeof(double));
+      ds.tcol=(double*)malloc(n_vals*sizeof(double));
+      ds.emag=(double*)malloc(n_vals*sizeof(double));
+      ds.potential=(double*)malloc(n_vals*sizeof(double));
+      ds.pos=(vec*)malloc(n_vals*sizeof(vec));
+      inited=1;
+      if ((ds.pos == NULL) || (ds.tcol == NULL) || (ds.emag == NULL) ||
+	  (ds.potential == NULL) || (ds.sigma_resp == NULL)) {
+	fprintf(stderr,"can't allocate. exiting..\n");
+	exit(1);
+      }
+    }
   }
+
   
   drift(&pscpy,&ds,pars,msi,e,n_vals,FORWARD,&iter);
 
   *xpix=(int)floor((ds.pos[iter-1].x-offset)/(0.01/10.0));
   *ypix=(int)floor((ds.pos[iter-1].y-offset)/(0.01/10.0));
 
-  free(ds.sigma_resp);
-  free(ds.tcol);
-  free(ds.emag);
-  free(ds.potential);
-  free(ds.pos);
+  if (0) {
+    free(ds.sigma_resp);
+    free(ds.tcol);
+    free(ds.emag);
+    free(ds.potential);
+    free(ds.pos);
+  }
 }
 
 void locate_pix_edge (crn_subset *crn,ccd_runpars *ccd_rpp,multipole_stack *msi) {
